@@ -1,0 +1,9 @@
+﻿{
+    "version":  "2026.06.10-broker-value-sync-22",
+    "server_version":  "2026.06.10-broker-value-sync-22",
+    "file":  "app.py",
+    "sha256":  "f0b7dcaf14a3a7cd26434656b063781c2fc4b06dfa9822ed469c715591ffba43",
+    "size":  843534,
+    "updated_at":  "2026-06-10T19:53:47",
+    "notes":  "Fresh Angel LTP/live value sync plus mobile build 39 UI restore/update metadata."
+}

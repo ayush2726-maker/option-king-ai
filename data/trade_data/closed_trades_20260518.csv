@@ -1,0 +1,2 @@
+date,time,exit_time,mode,trade_id,type,signal,symbol,entry,exit,qty,gross_pnl,charges,net_pnl,pnl,buy_charges,sell_charges,buy_turnover,sell_turnover,brokerage,stt,transaction,gst,stamp,sebi,reason
+2026-05-18,10:16:39,10:18:15,PAPER,OK20260518101639,HALF,CE,NIFTY19MAY2623400CE,114.25,119.9,455,2570.7500000000027,175.37110012525,2395.3788998747527,2395.3788998747527,47.00916634875,128.3619337765,51983.75,54554.5,40.0,81.83175,37.8423864,14.030806437,1.5595125,0.10653825,SL HIT

@@ -1,0 +1,15 @@
+{
+  "api_key": "",
+  "client_id": "",
+  "password": "",
+  "totp_secret": "",
+  "telegram_token": "",
+  "chat_id": "",
+  "api_auth_token": "optionking-local",
+  "capital": 20000,
+  "auto_start_bot": true,
+  "market_timezone": "Asia/Kolkata",
+  "market_holidays": [],
+  "host": "0.0.0.0",
+  "port": 8765
+}
