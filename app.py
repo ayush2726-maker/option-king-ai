@@ -167,6 +167,7 @@ total_trades = 0
 winning_trades = 0
 losing_trades = 0
 loss_streak = 0
+rejected_signals = {}
 
 last_confidence = 0
 last_score = 0
@@ -14286,17 +14287,36 @@ def _okai_quality_write_event(payload):
 
 
 def place_paper_trade(signal, premium, trade_type, option):
+    global rejected_signals
     if _safe_config_bool("trade_quality_gate_enabled", True):
         approved, quality = _okai_build_trade_quality(signal, premium, option, require_premium=True, backtest=False)
         if not approved:
             reason = "Quality blocked: " + "; ".join(quality.get("blocks") or [f"grade {quality.get('grade')} not allowed"])
-            gui_log(f"QUALITY ENTRY BLOCKED | {signal} | Grade {quality.get('grade')} | {reason}")
-            try:
-                update_trade_suggestion(None, "NONE", quality.get("score", last_score), 0, reason, last_nifty_price, option)
-            except Exception:
-                pass
-            safe_append_event("QUALITY_ENTRY_BLOCKED", quality)
-            _okai_quality_write_event({"event": "ENTRY_BLOCKED", **quality})
+            
+            # Cooldown logic: skip same setup for 20s unless score or NIFTY moves significantly
+            now = time.time()
+            score = quality.get("score", 0)
+            nifty = last_nifty_price
+            prev = rejected_signals.get(signal)
+            
+            should_log = True
+            if prev:
+                time_diff = now - prev.get("time", 0)
+                score_diff = abs(score - prev.get("score", 0))
+                nifty_diff = abs(nifty - prev.get("nifty", 0)) if nifty is not None and prev.get("nifty") is not None else 100
+                if time_diff < 20 and score_diff < 10 and nifty_diff < 20:
+                    should_log = False
+            
+            if should_log:
+                rejected_signals[signal] = {"time": now, "score": score, "nifty": nifty}
+                gui_log(f"QUALITY ENTRY BLOCKED | {signal} | Grade {quality.get('grade')} | {reason}")
+                try:
+                    update_trade_suggestion(None, "NONE", score, 0, reason, nifty, option)
+                except Exception:
+                    pass
+                safe_append_event("QUALITY_ENTRY_BLOCKED", quality)
+                _okai_quality_write_event({"event": "ENTRY_BLOCKED", **quality})
+            
             return None
         gui_log(
             f"QUALITY ENTRY APPROVED | {signal} | Grade {quality['grade']} | "
