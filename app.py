@@ -15945,9 +15945,14 @@ def _okai_runner_update_holder_sl(holder, ltp, log_func=None):
 
 
 def update_trailing_sl(*args, **kwargs):
+    """
+    Consolidated Trailing SL Logic.
+    Uses runner-aware SL tracking for both live and paper positions.
+    """
     global position
     if position is None:
         return
+    # Use existing runner-aware helper
     _okai_runner_update_holder_sl(position, position.get("ltp", position.get("entry")), gui_log)
 
 
@@ -16092,10 +16097,34 @@ def _okai_apply_runner_profit_guard(holder, premium, log_func=None):
 
 
 def extend_target_if_market_has_potential(current_price, premium):
-    result = _OKAI_RUNNER_GUARD_BASE_EXTEND_TARGET(current_price, premium)
-    if result and _okai_runner_target_enabled() and position is not None:
-        _okai_apply_runner_profit_guard(position, premium, gui_log)
-    return result
+    """
+    Consolidated Target Extension Engine (Trend Runner).
+    Allows positions to run beyond initial targets if trend is strong.
+    """
+    global position
+    if _okai_runner_target_enabled() and position is not None:
+        entry = _okai_float(position.get("entry"))
+        premium = _okai_float(premium)
+        if entry > 0 and premium > 0:
+            old_target = _okai_float(position.get("target"))
+            # Runner milestones
+            final_target = entry * (1 + _okai_runner_final_target_percent() / 100)
+            boosted_target = premium * (1 + _okai_runner_target_boost_percent() / 100)
+            
+            new_target = max(old_target, final_target, boosted_target)
+            
+            if new_target > old_target:
+                position["target_extensions"] = int(position.get("target_extensions", 0) or 0) + 1
+                position["target"] = new_target
+                gui_log(f"TARGET EXTENDED | {position.get('signal')} | {old_target:.2f} -> {new_target:.2f} (Ext #{position['target_extensions']})")
+                
+                # Apply profit guard from the latest patch
+                try:
+                    _okai_apply_runner_profit_guard(position, premium, gui_log)
+                except Exception as exc:
+                    gui_log(f"Profit guard error: {exc}")
+                return True
+    return False
 
 
 def realistic_intrabar_exit(position_bt, candle, detail_logs):
@@ -16548,23 +16577,78 @@ def place_paper_trade(signal, premium, trade_type, option):
 
 
 def manage_paper_trade(premium, current_price=None):
-    global position
-    if position is not None:
-        apply_profit_protect_to_position("manage")
+    """
+    Consolidated Exit Engine Entry Point.
+    Handles all active position management logic.
+    """
+    global position, running
+    
+    with active_position_lock:
+        if position is None:
+            return
+            
+        premium = _okai_float(premium)
+        current_price = _okai_float(current_price)
+        
+        # 1. Update State
+        position["ltp"] = premium
         try:
+            save_position_tick(premium, current_price, "MANAGE")
+        except Exception:
+            pass
+        
+        old_signal = position.get("signal")
+        
+        # 2. Index Reversal Exit
+        try:
+            reverse_exit, reverse_reason = should_exit_on_index_reversal(current_price)
+            if reverse_exit:
+                close_position(premium, reverse_reason)
+                try_stop_and_reverse(old_signal, current_price, reverse_reason)
+                return
+        except Exception as exc:
+            gui_log(f"Reversal check error: {exc}")
+
+        # 3. Trailing SL & Runner Logic
+        try:
+            update_trailing_sl()
+        except Exception as exc:
+            gui_log(f"Trailing SL error: {exc}")
+        
+        # 4. Profit Protect (10% SL if Daily P&L > 15%)
+        try:
+            apply_profit_protect_to_position("manage")
             if position.get("profit_protect_mode"):
                 entry = _okai_float(position.get("entry"))
-                sl_percent = _okai_float(position.get("profit_protect_sl_percent"), profit_protect_sl_percent())
+                sl_percent = _okai_float(position.get("profit_protect_sl_percent"), 10.0)
                 protect_exit = entry * (1.0 - sl_percent / 100.0)
-                if entry > 0 and _okai_float(premium) <= protect_exit:
+                if entry > 0 and premium <= protect_exit:
                     close_position(premium, f"PROFIT PROTECT {sl_percent:.0f}% STOP")
                     return
         except Exception as exc:
+            gui_log(f"Profit protect error: {exc}")
+
+        # 5. Stop Loss Hit
+        if premium <= _okai_float(position.get("sl")):
+            close_position(premium, "SL HIT")
+            return
+            
+        # 6. Target Hit & Extensions
+        if premium >= _okai_float(position.get("target")):
             try:
-                gui_log(f"Profit protect manage error: {str(exc)[:120]}")
-            except Exception:
-                pass
-    return _OKAI_PROFIT_PROTECT_BASE_MANAGE_PAPER_TRADE(premium, current_price)
+                if not extend_target_if_market_has_potential(current_price, premium):
+                    close_position(premium, "TARGET HIT")
+                    return
+            except Exception as exc:
+                gui_log(f"Target extension error: {exc}")
+                close_position(premium, "TARGET HIT")
+                return
+        
+        # 7. Partial Exit
+        try:
+            check_partial_exit()
+        except Exception as exc:
+            gui_log(f"Partial exit check error: {exc}")
 
 
 def build_settings_text():
@@ -19764,243 +19848,216 @@ def _okai_position_live_pnl_payload():
 
 
 def close_position(exit_price, reason):
+    """
+    Unified Exit Execution Engine.
+    Handles LIVE/PAPER exits, partial fill synchronization, stats updates, and history.
+    """
     global position, capital, daily_pnl, winning_trades, losing_trades, loss_streak
-    if position is None:
-        return None
-    mode = str(position.get("mode", trade_mode()) or "").upper()
-    if mode != "LIVE":
-        return _OKAI_BROKER_FILL_BASE_CLOSE_POSITION(exit_price, reason)
-
-    snapshot = dict(position or {})
-    exit_qty = _okai_broker_int(position.get("qty"), 0)
-    if exit_qty <= 0:
-        gui_log("LIVE EXIT BLOCKED | Qty is zero")
-        return None
-
-    try:
-        order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, reason)
-        fill = _okai_live_response_fill(response)
-        actual_exit = _okai_broker_float(fill.get("avg_price"), 0.0) if fill else 0.0
-        actual_qty = _okai_broker_int(fill.get("filled_qty"), 0) if fill else 0
-        if actual_exit <= 0:
-            actual_exit = _okai_broker_float(exit_price, 0.0)
-        if actual_qty <= 0:
+    
+    with active_position_lock:
+        if position is None:
+            return None
+            
+        mode = str(position.get("mode", trade_mode()) or "").upper()
+        symbol = (position.get("option") or {}).get("symbol", "DEMO")
+        entry = _okai_float(position.get("entry"), 0.0)
+        exit_qty = _okai_int(position.get("qty"), 0)
+        
+        # 1. LIVE EXECUTION
+        if mode == "LIVE":
+            if exit_qty <= 0:
+                gui_log(f"LIVE EXIT BLOCKED | {symbol} | Qty is zero")
+                return None
+            
+            try:
+                # Use standard live order placement
+                order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, reason)
+                fill = _okai_live_response_fill(response)
+                actual_exit = _okai_float(fill.get("avg_price"), exit_price)
+                actual_qty = _okai_int(fill.get("filled_qty"), exit_qty)
+                
+                # Update position with broker fill data
+                position["live_exit_order_id"] = order_id
+                position["live_exit_order_response"] = response
+                position["broker_exit_fill"] = fill
+                position["broker_exit_price"] = actual_exit
+                position["broker_exit_qty"] = actual_qty
+                position["exit_price_source"] = "ANGEL_AVERAGE_FILL" if (actual_exit > 0) else "BOT_LTP_PENDING_BROKER_FILL"
+                
+                exit_price = actual_exit
+                exit_qty = actual_qty
+            except Exception as exc:
+                gui_log(f"LIVE EXIT FAILED | {symbol} | Position kept open | {exc}")
+                send_msg(f"LIVE EXIT FAILED - MANUAL ACTION REQUIRED\nSymbol: {symbol}\nQty: {exit_qty}\nError: {exc}")
+                return None
+        else:
+            # PAPER MODE
+            actual_exit = exit_price
             actual_qty = exit_qty
-        position["live_exit_order_id"] = order_id
-        position["live_exit_order_response"] = response
-        position["broker_exit_fill"] = fill
-        position["broker_exit_price"] = actual_exit
-        position["broker_exit_qty"] = actual_qty
-        position["exit_price_source"] = "ANGEL_AVERAGE_FILL" if fill and _okai_broker_float(fill.get("avg_price"), 0) > 0 else "BOT_LTP_PENDING_BROKER_FILL"
-    except Exception as exc:
-        gui_log(f"LIVE EXIT FAILED | Position kept open | {exc}")
-        send_msg(
-            "LIVE EXIT FAILED - MANUAL ACTION REQUIRED\n"
-            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
-            f"Qty: {exit_qty}\nReason: {reason}\nError: {exc}"
-        )
-        return None
 
-    entry = _okai_broker_float(position.get("entry"), 0.0)
-    calc_qty = min(exit_qty, actual_qty) if actual_qty > 0 else exit_qty
-    gross_pnl = (actual_exit - entry) * calc_qty
-    charges = position_exit_charges(actual_exit, calc_qty)
-    net_pnl = gross_pnl - _okai_broker_float(charges.get("total"), 0.0)
-    capital += net_pnl
-    daily_pnl += net_pnl
-
-    if calc_qty < exit_qty:
-        position["qty"] = exit_qty - calc_qty
-        position["closed_qty"] = _okai_broker_int(position.get("closed_qty"), 0) + calc_qty
-        save_trade_event("PARTIAL_EXIT", {
-            "mode": mode,
-            "trade_id": position.get("trade_id", ""),
-            "trade_type": position.get("trade_type", "FULL"),
-            "signal": position["signal"],
-            "option": position.get("option"),
-            "entry": entry,
-            "exit": actual_exit,
-            "ltp": actual_exit,
-            "qty": calc_qty,
-            "remaining_qty": position.get("qty"),
-            "pnl": net_pnl,
-            "gross_pnl": gross_pnl,
-            "charges": charges,
-            "net_pnl": net_pnl,
-            "reason": f"{reason} (broker partial fill)",
-            "live_exit_order_id": position.get("live_exit_order_id", ""),
-            "broker_exit_price": actual_exit,
-            "broker_exit_qty": calc_qty,
-            "exit_price_source": position.get("exit_price_source"),
-        })
+        # 2. P&L CALCULATION
+        gross_pnl = (actual_exit - entry) * actual_qty
+        charges = position_exit_charges(actual_exit, actual_qty)
+        net_pnl = gross_pnl - _okai_float(charges.get("total"), 0.0)
+        
+        # Handle Partial Booked P&L (if any)
+        partial_net = _okai_float(position.get("partial_booked_net_pnl"), 0.0)
+        partial_gross = _okai_float(position.get("partial_booked_gross_pnl"), 0.0)
+        partial_charges = _okai_float(position.get("partial_booked_charges"), 0.0)
+        
+        total_trade_net = partial_net + net_pnl
+        
+        # 3. GLOBAL STATE UPDATES
+        capital += net_pnl
+        daily_pnl += net_pnl
+        
+        # Stats update based on TOTAL trade P&L
+        if total_trade_net > 0:
+            winning_trades += 1
+            loss_streak = 0
+        else:
+            losing_trades += 1
+            loss_streak += 1
+            
+        # 4. HISTORY & PERSISTENCE
         try:
-            save_active_position_state("broker_partial_exit_fill")
+            record_trade(actual_exit, gross_pnl, charges, net_pnl, reason)
+            register_reentry_block(reason, total_trade_net)
+        except Exception as exc:
+            gui_log(f"Trade recording error: {exc}")
+        
+        # Total P&L Report for multi-leg trades
+        if partial_net:
+            try:
+                _okai_merge_partial_totals_into_last_closed_trade(dict(position), net_pnl, partial_net, partial_gross, partial_charges, reason)
+            except Exception as exc:
+                gui_log(f"Partial merge error: {exc}")
+                
+            total_text = (
+                f"TRADE TOTAL P&L | {symbol}\n"
+                f"Net Booked: {total_trade_net:.2f} (Partial: {partial_net:.2f} + Final: {net_pnl:.2f})\n"
+                f"Capital: {capital:.2f} | Daily: {daily_pnl:.2f}"
+            )
+            gui_log(total_text)
+            send_msg(total_text)
+        else:
+            msg = (
+                f"{mode} EXIT | {symbol} | {reason}\n"
+                f"Entry: {entry:.2f} | Exit: {actual_exit:.2f} | Qty: {actual_qty}\n"
+                f"Net P&L: {net_pnl:.2f} | Capital: {capital:.2f}"
+            )
+            gui_log(msg)
+            send_msg(msg)
+
+        # 5. CLEANUP
+        position = None
+        try:
+            clear_active_position_state()
         except Exception:
             pass
-        msg = (
-            "LIVE EXIT PARTIAL FILL\n"
-            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
-            f"Sold Qty: {calc_qty} | Remaining Qty: {position.get('qty')}\n"
-            f"Broker Avg Exit: {actual_exit:.2f}\n"
-            f"Net P&L Booked: {net_pnl:.2f}\n"
-            f"Order ID: {position.get('live_exit_order_id')}"
-        )
-        gui_log(msg)
-        send_msg(msg)
+        
+        # Trigger entry cooldown on loss streak
+        if loss_streak >= _safe_config_int("safe_max_consecutive_losses", 2):
+            cooldown = _safe_config_float("safe_loss_cooldown_minutes", 30) * 60
+            safe_runtime["entry_cooldown_until"] = time.time() + cooldown
+            
         return net_pnl
-
-    update_trade_stats(net_pnl)
-    position["ltp"] = actual_exit
-    position["qty"] = calc_qty
-    record_trade(actual_exit, gross_pnl, charges, net_pnl, reason)
-    try:
-        if trade_history:
-            trade_history[-1].update({
-                "requested_entry": snapshot.get("requested_entry", ""),
-                "broker_entry_price": snapshot.get("broker_entry_price", position.get("entry", "")),
-                "broker_entry_qty": snapshot.get("broker_entry_qty", snapshot.get("entry_qty", "")),
-                "broker_exit_price": actual_exit,
-                "broker_exit_qty": calc_qty,
-                "entry_price_source": snapshot.get("entry_price_source", ""),
-                "exit_price_source": position.get("exit_price_source", ""),
-            })
-    except Exception:
-        pass
-    register_reentry_block(reason, net_pnl)
-    partial_net = _okai_broker_float(snapshot.get("partial_booked_net_pnl"), 0.0)
-    partial_gross = _okai_broker_float(snapshot.get("partial_booked_gross_pnl"), 0.0)
-    partial_charges = _okai_broker_float(snapshot.get("partial_booked_charges"), 0.0)
-    if partial_net and "_okai_merge_partial_totals_into_last_closed_trade" in globals():
-        try:
-            _okai_merge_partial_totals_into_last_closed_trade(snapshot, net_pnl, partial_net, partial_gross, partial_charges, reason)
-        except Exception as exc:
-            gui_log(f"Broker fill partial total merge skipped: {exc}")
-    title = "LIVE EXIT"
-    msg = (
-        f"{title}\nReason: {reason}\nSymbol: {snapshot.get('option', {}).get('symbol', 'DEMO')}\n"
-        f"Broker Avg Exit: {actual_exit:.2f}\nEntry: {entry:.2f}\nQty: {calc_qty}\n"
-        f"Gross P&L: {gross_pnl:.2f}\nCharges: {charges['total']:.2f}\n"
-        f"Net P&L: {net_pnl:.2f}\nCapital: {capital:.2f}\n"
-        f"Exit Order ID: {position.get('live_exit_order_id')}"
-    )
-    closed_position = dict(position)
-    position = None
-    try:
-        clear_active_position_state()
-    except Exception:
-        pass
-    try:
-        safe_append_event("POSITION_CLOSED", {
-            "exit_price": actual_exit,
-            "reason": reason,
-            "pnl": net_pnl,
-            "broker_exit_price": actual_exit,
-            "broker_exit_qty": calc_qty,
-            "position": closed_position,
-        })
-    except Exception:
-        pass
-    gui_log(msg)
-    send_msg(msg)
-    return net_pnl
 
 
 def check_partial_exit():
+    """
+    Consolidated Partial Exit Logic.
+    Exits 50% of position when target + 5% profit is reached.
+    """
     global capital, daily_pnl
-    if position is None or position.get("partial_done"):
-        return
-    if str(position.get("mode", trade_mode()) or "").upper() != "LIVE":
-        return _OKAI_BROKER_FILL_BASE_CHECK_PARTIAL_EXIT()
-    entry = _okai_broker_float(position.get("entry"), 0.0)
-    ltp = _okai_broker_float(position.get("ltp"), entry)
-    if entry <= 0:
-        return
-    profit_percent = ((ltp - entry) / entry) * 100
-    partial_trigger = (EXPIRY_TARGET_PERCENT if is_expiry_day() else TARGET_PERCENT) + 5
-    if profit_percent < partial_trigger:
-        return
-    lot_size = get_position_lot_size()
-    current_qty = _okai_broker_int(position.get("qty"), 0)
-    if current_qty < lot_size * 2:
-        return
-    exit_lots = max(1, (current_qty // lot_size) // 2)
-    exit_qty = exit_lots * lot_size
-    if exit_qty <= 0 or current_qty - exit_qty < lot_size:
-        return
-    try:
-        order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, "PARTIAL EXIT")
-        fill = _okai_live_response_fill(response)
-        actual_exit = _okai_broker_float(fill.get("avg_price"), 0.0) if fill else 0.0
-        actual_qty = _okai_broker_int(fill.get("filled_qty"), 0) if fill else 0
-        if actual_exit <= 0:
+    
+    with active_position_lock:
+        if position is None or position.get("partial_done"):
+            return
+            
+        entry = _okai_float(position.get("entry"), 0.0)
+        ltp = _okai_float(position.get("ltp"), entry)
+        if entry <= 0:
+            return
+            
+        profit_percent = ((ltp - entry) / entry) * 100
+        # Preserve existing trigger logic: Target + 5%
+        partial_trigger = (EXPIRY_TARGET_PERCENT if is_expiry_day() else TARGET_PERCENT) + 5
+        
+        if profit_percent < partial_trigger:
+            return
+            
+        lot_size = get_position_lot_size()
+        current_qty = _okai_int(position.get("qty"), 0)
+        
+        # Must have at least 2 lots to do partial exit
+        if current_qty < lot_size * 2:
+            return
+            
+        exit_lots = max(1, (current_qty // lot_size) // 2)
+        exit_qty = exit_lots * lot_size
+        
+        # Ensure remaining qty is at least one lot
+        if exit_qty <= 0 or current_qty - exit_qty < lot_size:
+            return
+            
+        gui_log(f"PARTIAL EXIT TRIGGERED | {profit_percent:.2f}% | Target: {partial_trigger}% | Qty: {exit_qty}")
+        
+        mode = str(position.get("mode", trade_mode()) or "").upper()
+        
+        if mode == "LIVE":
+            try:
+                order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, "PARTIAL EXIT")
+                fill = _okai_live_response_fill(response)
+                actual_exit = _okai_float(fill.get("avg_price"), ltp)
+                actual_qty = _okai_int(fill.get("filled_qty"), exit_qty)
+            except Exception as exc:
+                gui_log(f"LIVE PARTIAL EXIT FAILED | Qty: {exit_qty} | {exc}")
+                send_msg(f"LIVE PARTIAL EXIT FAILED\nSymbol: {position.get('option', {}).get('symbol')}\nError: {exc}")
+                return
+        else:
             actual_exit = ltp
-        if actual_qty <= 0:
             actual_qty = exit_qty
-    except Exception as exc:
-        gui_log(f"LIVE PARTIAL EXIT FAILED | Position kept full | {exc}")
-        send_msg(
-            "LIVE PARTIAL EXIT FAILED - MANUAL ACTION REQUIRED\n"
-            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
-            f"Qty: {exit_qty}\nError: {exc}"
+
+        # Book Partial P&L
+        booked_gross = (actual_exit - entry) * actual_qty
+        charges = position_exit_charges(actual_exit, actual_qty)
+        booked_net = booked_gross - _okai_float(charges.get("total"), 0.0)
+        
+        capital += booked_net
+        daily_pnl += booked_net
+        
+        # Update Position state
+        position["qty"] = current_qty - actual_qty
+        position["partial_done"] = True
+        position["partial_exit_price"] = actual_exit
+        position["partial_exit_qty"] = actual_qty
+        position["partial_booked_net_pnl"] = booked_net
+        position["partial_booked_gross_pnl"] = booked_gross
+        position["partial_booked_charges"] = _okai_float(charges.get("total"), 0.0)
+        
+        # History
+        try:
+            save_trade_event("PARTIAL_EXIT", {
+                "mode": mode,
+                "trade_id": position.get("trade_id", ""),
+                "entry": entry,
+                "exit": actual_exit,
+                "qty": actual_qty,
+                "pnl": booked_net,
+                "reason": "PARTIAL EXIT",
+            })
+            save_active_position_state("partial_exit_booked")
+        except Exception as exc:
+            gui_log(f"Partial exit history error: {exc}")
+        
+        msg = (
+            f"PARTIAL EXIT DONE | {booked_net:.2f} Booked\n"
+            f"Symbol: {position.get('option', {}).get('symbol')}\n"
+            f"Exit: {actual_exit:.2f} | Sold: {actual_qty} | Left: {position['qty']}"
         )
-        return
-    actual_qty = min(actual_qty, current_qty)
-    gross_pnl = (actual_exit - entry) * actual_qty
-    charges = position_exit_charges(actual_exit, actual_qty)
-    net_pnl = gross_pnl - _okai_broker_float(charges.get("total"), 0.0)
-    remaining_qty = current_qty - actual_qty
-    capital += net_pnl
-    daily_pnl += net_pnl
-    position["qty"] = remaining_qty
-    position["closed_qty"] = _okai_broker_int(position.get("closed_qty"), 0) + actual_qty
-    position["partial_done"] = True
-    position["partial_booked_net_pnl"] = _okai_broker_float(position.get("partial_booked_net_pnl"), 0.0) + net_pnl
-    position["partial_booked_gross_pnl"] = _okai_broker_float(position.get("partial_booked_gross_pnl"), 0.0) + gross_pnl
-    position["partial_booked_charges"] = _okai_broker_float(position.get("partial_booked_charges"), 0.0) + charges["total"]
-    position["partial_booked_buy_charges"] = _okai_broker_float(position.get("partial_booked_buy_charges"), 0.0) + charges.get("buy_charges", charges.get("buy_total", 0))
-    position["partial_booked_sell_charges"] = _okai_broker_float(position.get("partial_booked_sell_charges"), 0.0) + charges.get("sell_charges", charges.get("sell_total", 0))
-    position["partial_exit_price"] = actual_exit
-    position["partial_exit_qty"] = actual_qty
-    position["broker_partial_exit_price"] = actual_exit
-    position["broker_partial_exit_qty"] = actual_qty
-    msg = (
-        "LIVE PARTIAL EXIT\n"
-        f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
-        f"Sold Qty: {actual_qty} | Remaining Qty: {remaining_qty}\n"
-        f"Broker Avg Exit: {actual_exit:.2f}\n"
-        f"Booked Gross: {gross_pnl:.2f}\n"
-        f"Booked Charges: {charges['total']:.2f}\n"
-        f"Booked Net: {net_pnl:.2f}\n"
-        f"Capital: {capital:.2f}\n"
-        f"Order ID: {order_id}"
-    )
-    gui_log(msg)
-    send_msg(msg)
-    save_trade_event("PARTIAL_EXIT", {
-        "mode": "LIVE",
-        "trade_id": position.get("trade_id", ""),
-        "trade_type": position.get("trade_type", "FULL"),
-        "signal": position["signal"],
-        "option": position.get("option"),
-        "entry": entry,
-        "exit": actual_exit,
-        "ltp": actual_exit,
-        "qty": actual_qty,
-        "remaining_qty": remaining_qty,
-        "pnl": net_pnl,
-        "gross_pnl": gross_pnl,
-        "charges": charges,
-        "net_pnl": net_pnl,
-        "reason": "PARTIAL EXIT",
-        "live_exit_order_id": order_id,
-        "broker_exit_price": actual_exit,
-        "broker_exit_qty": actual_qty,
-        "exit_price_source": "ANGEL_AVERAGE_FILL",
-    })
-    try:
-        save_active_position_state("broker_partial_exit")
-    except Exception:
-        pass
+        gui_log(msg)
+        send_msg(msg)
 
 
 def get_position_payload():
