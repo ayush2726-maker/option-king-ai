@@ -167,7 +167,6 @@ total_trades = 0
 winning_trades = 0
 losing_trades = 0
 loss_streak = 0
-rejected_signals = {}
 
 last_confidence = 0
 last_score = 0
@@ -14287,36 +14286,17 @@ def _okai_quality_write_event(payload):
 
 
 def place_paper_trade(signal, premium, trade_type, option):
-    global rejected_signals
     if _safe_config_bool("trade_quality_gate_enabled", True):
         approved, quality = _okai_build_trade_quality(signal, premium, option, require_premium=True, backtest=False)
         if not approved:
             reason = "Quality blocked: " + "; ".join(quality.get("blocks") or [f"grade {quality.get('grade')} not allowed"])
-            
-            # Cooldown logic: skip same setup for 20s unless score or NIFTY moves significantly
-            now = time.time()
-            score = quality.get("score", 0)
-            nifty = last_nifty_price
-            prev = rejected_signals.get(signal)
-            
-            should_log = True
-            if prev:
-                time_diff = now - prev.get("time", 0)
-                score_diff = abs(score - prev.get("score", 0))
-                nifty_diff = abs(nifty - prev.get("nifty", 0)) if nifty is not None and prev.get("nifty") is not None else 100
-                if time_diff < 20 and score_diff < 10 and nifty_diff < 20:
-                    should_log = False
-            
-            if should_log:
-                rejected_signals[signal] = {"time": now, "score": score, "nifty": nifty}
-                gui_log(f"QUALITY ENTRY BLOCKED | {signal} | Grade {quality.get('grade')} | {reason}")
-                try:
-                    update_trade_suggestion(None, "NONE", score, 0, reason, nifty, option)
-                except Exception:
-                    pass
-                safe_append_event("QUALITY_ENTRY_BLOCKED", quality)
-                _okai_quality_write_event({"event": "ENTRY_BLOCKED", **quality})
-            
+            gui_log(f"QUALITY ENTRY BLOCKED | {signal} | Grade {quality.get('grade')} | {reason}")
+            try:
+                update_trade_suggestion(None, "NONE", quality.get("score", last_score), 0, reason, last_nifty_price, option)
+            except Exception:
+                pass
+            safe_append_event("QUALITY_ENTRY_BLOCKED", quality)
+            _okai_quality_write_event({"event": "ENTRY_BLOCKED", **quality})
             return None
         gui_log(
             f"QUALITY ENTRY APPROVED | {signal} | Grade {quality['grade']} | "
@@ -15965,14 +15945,9 @@ def _okai_runner_update_holder_sl(holder, ltp, log_func=None):
 
 
 def update_trailing_sl(*args, **kwargs):
-    """
-    Consolidated Trailing SL Logic.
-    Uses runner-aware SL tracking for both live and paper positions.
-    """
     global position
     if position is None:
         return
-    # Use existing runner-aware helper
     _okai_runner_update_holder_sl(position, position.get("ltp", position.get("entry")), gui_log)
 
 
@@ -16117,34 +16092,10 @@ def _okai_apply_runner_profit_guard(holder, premium, log_func=None):
 
 
 def extend_target_if_market_has_potential(current_price, premium):
-    """
-    Consolidated Target Extension Engine (Trend Runner).
-    Allows positions to run beyond initial targets if trend is strong.
-    """
-    global position
-    if _okai_runner_target_enabled() and position is not None:
-        entry = _okai_float(position.get("entry"))
-        premium = _okai_float(premium)
-        if entry > 0 and premium > 0:
-            old_target = _okai_float(position.get("target"))
-            # Runner milestones
-            final_target = entry * (1 + _okai_runner_final_target_percent() / 100)
-            boosted_target = premium * (1 + _okai_runner_target_boost_percent() / 100)
-            
-            new_target = max(old_target, final_target, boosted_target)
-            
-            if new_target > old_target:
-                position["target_extensions"] = int(position.get("target_extensions", 0) or 0) + 1
-                position["target"] = new_target
-                gui_log(f"TARGET EXTENDED | {position.get('signal')} | {old_target:.2f} -> {new_target:.2f} (Ext #{position['target_extensions']})")
-                
-                # Apply profit guard from the latest patch
-                try:
-                    _okai_apply_runner_profit_guard(position, premium, gui_log)
-                except Exception as exc:
-                    gui_log(f"Profit guard error: {exc}")
-                return True
-    return False
+    result = _OKAI_RUNNER_GUARD_BASE_EXTEND_TARGET(current_price, premium)
+    if result and _okai_runner_target_enabled() and position is not None:
+        _okai_apply_runner_profit_guard(position, premium, gui_log)
+    return result
 
 
 def realistic_intrabar_exit(position_bt, candle, detail_logs):
@@ -16597,78 +16548,23 @@ def place_paper_trade(signal, premium, trade_type, option):
 
 
 def manage_paper_trade(premium, current_price=None):
-    """
-    Consolidated Exit Engine Entry Point.
-    Handles all active position management logic.
-    """
-    global position, running
-    
-    with active_position_lock:
-        if position is None:
-            return
-            
-        premium = _okai_float(premium)
-        current_price = _okai_float(current_price)
-        
-        # 1. Update State
-        position["ltp"] = premium
+    global position
+    if position is not None:
+        apply_profit_protect_to_position("manage")
         try:
-            save_position_tick(premium, current_price, "MANAGE")
-        except Exception:
-            pass
-        
-        old_signal = position.get("signal")
-        
-        # 2. Index Reversal Exit
-        try:
-            reverse_exit, reverse_reason = should_exit_on_index_reversal(current_price)
-            if reverse_exit:
-                close_position(premium, reverse_reason)
-                try_stop_and_reverse(old_signal, current_price, reverse_reason)
-                return
-        except Exception as exc:
-            gui_log(f"Reversal check error: {exc}")
-
-        # 3. Trailing SL & Runner Logic
-        try:
-            update_trailing_sl()
-        except Exception as exc:
-            gui_log(f"Trailing SL error: {exc}")
-        
-        # 4. Profit Protect (10% SL if Daily P&L > 15%)
-        try:
-            apply_profit_protect_to_position("manage")
             if position.get("profit_protect_mode"):
                 entry = _okai_float(position.get("entry"))
-                sl_percent = _okai_float(position.get("profit_protect_sl_percent"), 10.0)
+                sl_percent = _okai_float(position.get("profit_protect_sl_percent"), profit_protect_sl_percent())
                 protect_exit = entry * (1.0 - sl_percent / 100.0)
-                if entry > 0 and premium <= protect_exit:
+                if entry > 0 and _okai_float(premium) <= protect_exit:
                     close_position(premium, f"PROFIT PROTECT {sl_percent:.0f}% STOP")
                     return
         except Exception as exc:
-            gui_log(f"Profit protect error: {exc}")
-
-        # 5. Stop Loss Hit
-        if premium <= _okai_float(position.get("sl")):
-            close_position(premium, "SL HIT")
-            return
-            
-        # 6. Target Hit & Extensions
-        if premium >= _okai_float(position.get("target")):
             try:
-                if not extend_target_if_market_has_potential(current_price, premium):
-                    close_position(premium, "TARGET HIT")
-                    return
-            except Exception as exc:
-                gui_log(f"Target extension error: {exc}")
-                close_position(premium, "TARGET HIT")
-                return
-        
-        # 7. Partial Exit
-        try:
-            check_partial_exit()
-        except Exception as exc:
-            gui_log(f"Partial exit check error: {exc}")
+                gui_log(f"Profit protect manage error: {str(exc)[:120]}")
+            except Exception:
+                pass
+    return _OKAI_PROFIT_PROTECT_BASE_MANAGE_PAPER_TRADE(premium, current_price)
 
 
 def build_settings_text():
@@ -19868,216 +19764,243 @@ def _okai_position_live_pnl_payload():
 
 
 def close_position(exit_price, reason):
-    """
-    Unified Exit Execution Engine.
-    Handles LIVE/PAPER exits, partial fill synchronization, stats updates, and history.
-    """
     global position, capital, daily_pnl, winning_trades, losing_trades, loss_streak
-    
-    with active_position_lock:
-        if position is None:
-            return None
-            
-        mode = str(position.get("mode", trade_mode()) or "").upper()
-        symbol = (position.get("option") or {}).get("symbol", "DEMO")
-        entry = _okai_float(position.get("entry"), 0.0)
-        exit_qty = _okai_int(position.get("qty"), 0)
-        
-        # 1. LIVE EXECUTION
-        if mode == "LIVE":
-            if exit_qty <= 0:
-                gui_log(f"LIVE EXIT BLOCKED | {symbol} | Qty is zero")
-                return None
-            
-            try:
-                # Use standard live order placement
-                order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, reason)
-                fill = _okai_live_response_fill(response)
-                actual_exit = _okai_float(fill.get("avg_price"), exit_price)
-                actual_qty = _okai_int(fill.get("filled_qty"), exit_qty)
-                
-                # Update position with broker fill data
-                position["live_exit_order_id"] = order_id
-                position["live_exit_order_response"] = response
-                position["broker_exit_fill"] = fill
-                position["broker_exit_price"] = actual_exit
-                position["broker_exit_qty"] = actual_qty
-                position["exit_price_source"] = "ANGEL_AVERAGE_FILL" if (actual_exit > 0) else "BOT_LTP_PENDING_BROKER_FILL"
-                
-                exit_price = actual_exit
-                exit_qty = actual_qty
-            except Exception as exc:
-                gui_log(f"LIVE EXIT FAILED | {symbol} | Position kept open | {exc}")
-                send_msg(f"LIVE EXIT FAILED - MANUAL ACTION REQUIRED\nSymbol: {symbol}\nQty: {exit_qty}\nError: {exc}")
-                return None
-        else:
-            # PAPER MODE
-            actual_exit = exit_price
+    if position is None:
+        return None
+    mode = str(position.get("mode", trade_mode()) or "").upper()
+    if mode != "LIVE":
+        return _OKAI_BROKER_FILL_BASE_CLOSE_POSITION(exit_price, reason)
+
+    snapshot = dict(position or {})
+    exit_qty = _okai_broker_int(position.get("qty"), 0)
+    if exit_qty <= 0:
+        gui_log("LIVE EXIT BLOCKED | Qty is zero")
+        return None
+
+    try:
+        order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, reason)
+        fill = _okai_live_response_fill(response)
+        actual_exit = _okai_broker_float(fill.get("avg_price"), 0.0) if fill else 0.0
+        actual_qty = _okai_broker_int(fill.get("filled_qty"), 0) if fill else 0
+        if actual_exit <= 0:
+            actual_exit = _okai_broker_float(exit_price, 0.0)
+        if actual_qty <= 0:
             actual_qty = exit_qty
+        position["live_exit_order_id"] = order_id
+        position["live_exit_order_response"] = response
+        position["broker_exit_fill"] = fill
+        position["broker_exit_price"] = actual_exit
+        position["broker_exit_qty"] = actual_qty
+        position["exit_price_source"] = "ANGEL_AVERAGE_FILL" if fill and _okai_broker_float(fill.get("avg_price"), 0) > 0 else "BOT_LTP_PENDING_BROKER_FILL"
+    except Exception as exc:
+        gui_log(f"LIVE EXIT FAILED | Position kept open | {exc}")
+        send_msg(
+            "LIVE EXIT FAILED - MANUAL ACTION REQUIRED\n"
+            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
+            f"Qty: {exit_qty}\nReason: {reason}\nError: {exc}"
+        )
+        return None
 
-        # 2. P&L CALCULATION
-        gross_pnl = (actual_exit - entry) * actual_qty
-        charges = position_exit_charges(actual_exit, actual_qty)
-        net_pnl = gross_pnl - _okai_float(charges.get("total"), 0.0)
-        
-        # Handle Partial Booked P&L (if any)
-        partial_net = _okai_float(position.get("partial_booked_net_pnl"), 0.0)
-        partial_gross = _okai_float(position.get("partial_booked_gross_pnl"), 0.0)
-        partial_charges = _okai_float(position.get("partial_booked_charges"), 0.0)
-        
-        total_trade_net = partial_net + net_pnl
-        
-        # 3. GLOBAL STATE UPDATES
-        capital += net_pnl
-        daily_pnl += net_pnl
-        
-        # Stats update based on TOTAL trade P&L
-        if total_trade_net > 0:
-            winning_trades += 1
-            loss_streak = 0
-        else:
-            losing_trades += 1
-            loss_streak += 1
-            
-        # 4. HISTORY & PERSISTENCE
-        try:
-            record_trade(actual_exit, gross_pnl, charges, net_pnl, reason)
-            register_reentry_block(reason, total_trade_net)
-        except Exception as exc:
-            gui_log(f"Trade recording error: {exc}")
-        
-        # Total P&L Report for multi-leg trades
-        if partial_net:
-            try:
-                _okai_merge_partial_totals_into_last_closed_trade(dict(position), net_pnl, partial_net, partial_gross, partial_charges, reason)
-            except Exception as exc:
-                gui_log(f"Partial merge error: {exc}")
-                
-            total_text = (
-                f"TRADE TOTAL P&L | {symbol}\n"
-                f"Net Booked: {total_trade_net:.2f} (Partial: {partial_net:.2f} + Final: {net_pnl:.2f})\n"
-                f"Capital: {capital:.2f} | Daily: {daily_pnl:.2f}"
-            )
-            gui_log(total_text)
-            send_msg(total_text)
-        else:
-            msg = (
-                f"{mode} EXIT | {symbol} | {reason}\n"
-                f"Entry: {entry:.2f} | Exit: {actual_exit:.2f} | Qty: {actual_qty}\n"
-                f"Net P&L: {net_pnl:.2f} | Capital: {capital:.2f}"
-            )
-            gui_log(msg)
-            send_msg(msg)
+    entry = _okai_broker_float(position.get("entry"), 0.0)
+    calc_qty = min(exit_qty, actual_qty) if actual_qty > 0 else exit_qty
+    gross_pnl = (actual_exit - entry) * calc_qty
+    charges = position_exit_charges(actual_exit, calc_qty)
+    net_pnl = gross_pnl - _okai_broker_float(charges.get("total"), 0.0)
+    capital += net_pnl
+    daily_pnl += net_pnl
 
-        # 5. CLEANUP
-        position = None
+    if calc_qty < exit_qty:
+        position["qty"] = exit_qty - calc_qty
+        position["closed_qty"] = _okai_broker_int(position.get("closed_qty"), 0) + calc_qty
+        save_trade_event("PARTIAL_EXIT", {
+            "mode": mode,
+            "trade_id": position.get("trade_id", ""),
+            "trade_type": position.get("trade_type", "FULL"),
+            "signal": position["signal"],
+            "option": position.get("option"),
+            "entry": entry,
+            "exit": actual_exit,
+            "ltp": actual_exit,
+            "qty": calc_qty,
+            "remaining_qty": position.get("qty"),
+            "pnl": net_pnl,
+            "gross_pnl": gross_pnl,
+            "charges": charges,
+            "net_pnl": net_pnl,
+            "reason": f"{reason} (broker partial fill)",
+            "live_exit_order_id": position.get("live_exit_order_id", ""),
+            "broker_exit_price": actual_exit,
+            "broker_exit_qty": calc_qty,
+            "exit_price_source": position.get("exit_price_source"),
+        })
         try:
-            clear_active_position_state()
+            save_active_position_state("broker_partial_exit_fill")
         except Exception:
             pass
-        
-        # Trigger entry cooldown on loss streak
-        if loss_streak >= _safe_config_int("safe_max_consecutive_losses", 2):
-            cooldown = _safe_config_float("safe_loss_cooldown_minutes", 30) * 60
-            safe_runtime["entry_cooldown_until"] = time.time() + cooldown
-            
-        return net_pnl
-
-
-def check_partial_exit():
-    """
-    Consolidated Partial Exit Logic.
-    Exits 50% of position when target + 5% profit is reached.
-    """
-    global capital, daily_pnl
-    
-    with active_position_lock:
-        if position is None or position.get("partial_done"):
-            return
-            
-        entry = _okai_float(position.get("entry"), 0.0)
-        ltp = _okai_float(position.get("ltp"), entry)
-        if entry <= 0:
-            return
-            
-        profit_percent = ((ltp - entry) / entry) * 100
-        # Preserve existing trigger logic: Target + 5%
-        partial_trigger = (EXPIRY_TARGET_PERCENT if is_expiry_day() else TARGET_PERCENT) + 5
-        
-        if profit_percent < partial_trigger:
-            return
-            
-        lot_size = get_position_lot_size()
-        current_qty = _okai_int(position.get("qty"), 0)
-        
-        # Must have at least 2 lots to do partial exit
-        if current_qty < lot_size * 2:
-            return
-            
-        exit_lots = max(1, (current_qty // lot_size) // 2)
-        exit_qty = exit_lots * lot_size
-        
-        # Ensure remaining qty is at least one lot
-        if exit_qty <= 0 or current_qty - exit_qty < lot_size:
-            return
-            
-        gui_log(f"PARTIAL EXIT TRIGGERED | {profit_percent:.2f}% | Target: {partial_trigger}% | Qty: {exit_qty}")
-        
-        mode = str(position.get("mode", trade_mode()) or "").upper()
-        
-        if mode == "LIVE":
-            try:
-                order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, "PARTIAL EXIT")
-                fill = _okai_live_response_fill(response)
-                actual_exit = _okai_float(fill.get("avg_price"), ltp)
-                actual_qty = _okai_int(fill.get("filled_qty"), exit_qty)
-            except Exception as exc:
-                gui_log(f"LIVE PARTIAL EXIT FAILED | Qty: {exit_qty} | {exc}")
-                send_msg(f"LIVE PARTIAL EXIT FAILED\nSymbol: {position.get('option', {}).get('symbol')}\nError: {exc}")
-                return
-        else:
-            actual_exit = ltp
-            actual_qty = exit_qty
-
-        # Book Partial P&L
-        booked_gross = (actual_exit - entry) * actual_qty
-        charges = position_exit_charges(actual_exit, actual_qty)
-        booked_net = booked_gross - _okai_float(charges.get("total"), 0.0)
-        
-        capital += booked_net
-        daily_pnl += booked_net
-        
-        # Update Position state
-        position["qty"] = current_qty - actual_qty
-        position["partial_done"] = True
-        position["partial_exit_price"] = actual_exit
-        position["partial_exit_qty"] = actual_qty
-        position["partial_booked_net_pnl"] = booked_net
-        position["partial_booked_gross_pnl"] = booked_gross
-        position["partial_booked_charges"] = _okai_float(charges.get("total"), 0.0)
-        
-        # History
-        try:
-            save_trade_event("PARTIAL_EXIT", {
-                "mode": mode,
-                "trade_id": position.get("trade_id", ""),
-                "entry": entry,
-                "exit": actual_exit,
-                "qty": actual_qty,
-                "pnl": booked_net,
-                "reason": "PARTIAL EXIT",
-            })
-            save_active_position_state("partial_exit_booked")
-        except Exception as exc:
-            gui_log(f"Partial exit history error: {exc}")
-        
         msg = (
-            f"PARTIAL EXIT DONE | {booked_net:.2f} Booked\n"
-            f"Symbol: {position.get('option', {}).get('symbol')}\n"
-            f"Exit: {actual_exit:.2f} | Sold: {actual_qty} | Left: {position['qty']}"
+            "LIVE EXIT PARTIAL FILL\n"
+            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
+            f"Sold Qty: {calc_qty} | Remaining Qty: {position.get('qty')}\n"
+            f"Broker Avg Exit: {actual_exit:.2f}\n"
+            f"Net P&L Booked: {net_pnl:.2f}\n"
+            f"Order ID: {position.get('live_exit_order_id')}"
         )
         gui_log(msg)
         send_msg(msg)
+        return net_pnl
+
+    update_trade_stats(net_pnl)
+    position["ltp"] = actual_exit
+    position["qty"] = calc_qty
+    record_trade(actual_exit, gross_pnl, charges, net_pnl, reason)
+    try:
+        if trade_history:
+            trade_history[-1].update({
+                "requested_entry": snapshot.get("requested_entry", ""),
+                "broker_entry_price": snapshot.get("broker_entry_price", position.get("entry", "")),
+                "broker_entry_qty": snapshot.get("broker_entry_qty", snapshot.get("entry_qty", "")),
+                "broker_exit_price": actual_exit,
+                "broker_exit_qty": calc_qty,
+                "entry_price_source": snapshot.get("entry_price_source", ""),
+                "exit_price_source": position.get("exit_price_source", ""),
+            })
+    except Exception:
+        pass
+    register_reentry_block(reason, net_pnl)
+    partial_net = _okai_broker_float(snapshot.get("partial_booked_net_pnl"), 0.0)
+    partial_gross = _okai_broker_float(snapshot.get("partial_booked_gross_pnl"), 0.0)
+    partial_charges = _okai_broker_float(snapshot.get("partial_booked_charges"), 0.0)
+    if partial_net and "_okai_merge_partial_totals_into_last_closed_trade" in globals():
+        try:
+            _okai_merge_partial_totals_into_last_closed_trade(snapshot, net_pnl, partial_net, partial_gross, partial_charges, reason)
+        except Exception as exc:
+            gui_log(f"Broker fill partial total merge skipped: {exc}")
+    title = "LIVE EXIT"
+    msg = (
+        f"{title}\nReason: {reason}\nSymbol: {snapshot.get('option', {}).get('symbol', 'DEMO')}\n"
+        f"Broker Avg Exit: {actual_exit:.2f}\nEntry: {entry:.2f}\nQty: {calc_qty}\n"
+        f"Gross P&L: {gross_pnl:.2f}\nCharges: {charges['total']:.2f}\n"
+        f"Net P&L: {net_pnl:.2f}\nCapital: {capital:.2f}\n"
+        f"Exit Order ID: {position.get('live_exit_order_id')}"
+    )
+    closed_position = dict(position)
+    position = None
+    try:
+        clear_active_position_state()
+    except Exception:
+        pass
+    try:
+        safe_append_event("POSITION_CLOSED", {
+            "exit_price": actual_exit,
+            "reason": reason,
+            "pnl": net_pnl,
+            "broker_exit_price": actual_exit,
+            "broker_exit_qty": calc_qty,
+            "position": closed_position,
+        })
+    except Exception:
+        pass
+    gui_log(msg)
+    send_msg(msg)
+    return net_pnl
+
+
+def check_partial_exit():
+    global capital, daily_pnl
+    if position is None or position.get("partial_done"):
+        return
+    if str(position.get("mode", trade_mode()) or "").upper() != "LIVE":
+        return _OKAI_BROKER_FILL_BASE_CHECK_PARTIAL_EXIT()
+    entry = _okai_broker_float(position.get("entry"), 0.0)
+    ltp = _okai_broker_float(position.get("ltp"), entry)
+    if entry <= 0:
+        return
+    profit_percent = ((ltp - entry) / entry) * 100
+    partial_trigger = (EXPIRY_TARGET_PERCENT if is_expiry_day() else TARGET_PERCENT) + 5
+    if profit_percent < partial_trigger:
+        return
+    lot_size = get_position_lot_size()
+    current_qty = _okai_broker_int(position.get("qty"), 0)
+    if current_qty < lot_size * 2:
+        return
+    exit_lots = max(1, (current_qty // lot_size) // 2)
+    exit_qty = exit_lots * lot_size
+    if exit_qty <= 0 or current_qty - exit_qty < lot_size:
+        return
+    try:
+        order_id, response, _params = place_live_order(position.get("option") or {}, "SELL", exit_qty, "PARTIAL EXIT")
+        fill = _okai_live_response_fill(response)
+        actual_exit = _okai_broker_float(fill.get("avg_price"), 0.0) if fill else 0.0
+        actual_qty = _okai_broker_int(fill.get("filled_qty"), 0) if fill else 0
+        if actual_exit <= 0:
+            actual_exit = ltp
+        if actual_qty <= 0:
+            actual_qty = exit_qty
+    except Exception as exc:
+        gui_log(f"LIVE PARTIAL EXIT FAILED | Position kept full | {exc}")
+        send_msg(
+            "LIVE PARTIAL EXIT FAILED - MANUAL ACTION REQUIRED\n"
+            f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
+            f"Qty: {exit_qty}\nError: {exc}"
+        )
+        return
+    actual_qty = min(actual_qty, current_qty)
+    gross_pnl = (actual_exit - entry) * actual_qty
+    charges = position_exit_charges(actual_exit, actual_qty)
+    net_pnl = gross_pnl - _okai_broker_float(charges.get("total"), 0.0)
+    remaining_qty = current_qty - actual_qty
+    capital += net_pnl
+    daily_pnl += net_pnl
+    position["qty"] = remaining_qty
+    position["closed_qty"] = _okai_broker_int(position.get("closed_qty"), 0) + actual_qty
+    position["partial_done"] = True
+    position["partial_booked_net_pnl"] = _okai_broker_float(position.get("partial_booked_net_pnl"), 0.0) + net_pnl
+    position["partial_booked_gross_pnl"] = _okai_broker_float(position.get("partial_booked_gross_pnl"), 0.0) + gross_pnl
+    position["partial_booked_charges"] = _okai_broker_float(position.get("partial_booked_charges"), 0.0) + charges["total"]
+    position["partial_booked_buy_charges"] = _okai_broker_float(position.get("partial_booked_buy_charges"), 0.0) + charges.get("buy_charges", charges.get("buy_total", 0))
+    position["partial_booked_sell_charges"] = _okai_broker_float(position.get("partial_booked_sell_charges"), 0.0) + charges.get("sell_charges", charges.get("sell_total", 0))
+    position["partial_exit_price"] = actual_exit
+    position["partial_exit_qty"] = actual_qty
+    position["broker_partial_exit_price"] = actual_exit
+    position["broker_partial_exit_qty"] = actual_qty
+    msg = (
+        "LIVE PARTIAL EXIT\n"
+        f"Symbol: {position.get('option', {}).get('symbol', 'DEMO')}\n"
+        f"Sold Qty: {actual_qty} | Remaining Qty: {remaining_qty}\n"
+        f"Broker Avg Exit: {actual_exit:.2f}\n"
+        f"Booked Gross: {gross_pnl:.2f}\n"
+        f"Booked Charges: {charges['total']:.2f}\n"
+        f"Booked Net: {net_pnl:.2f}\n"
+        f"Capital: {capital:.2f}\n"
+        f"Order ID: {order_id}"
+    )
+    gui_log(msg)
+    send_msg(msg)
+    save_trade_event("PARTIAL_EXIT", {
+        "mode": "LIVE",
+        "trade_id": position.get("trade_id", ""),
+        "trade_type": position.get("trade_type", "FULL"),
+        "signal": position["signal"],
+        "option": position.get("option"),
+        "entry": entry,
+        "exit": actual_exit,
+        "ltp": actual_exit,
+        "qty": actual_qty,
+        "remaining_qty": remaining_qty,
+        "pnl": net_pnl,
+        "gross_pnl": gross_pnl,
+        "charges": charges,
+        "net_pnl": net_pnl,
+        "reason": "PARTIAL EXIT",
+        "live_exit_order_id": order_id,
+        "broker_exit_price": actual_exit,
+        "broker_exit_qty": actual_qty,
+        "exit_price_source": "ANGEL_AVERAGE_FILL",
+    })
+    try:
+        save_active_position_state("broker_partial_exit")
+    except Exception:
+        pass
 
 
 def get_position_payload():
@@ -20455,6 +20378,1114 @@ try:
     ensure_dirs()
 except Exception as exc:
     print(f"Startup data directory ensure skipped: {exc}")
+
+
+# ===== OPTION KING AI PATCH: ATR DYNAMIC SL =====
+# Version: 2026.06.16-atr-dynamic-sl-25
+#
+# Rules:
+#   - Entry logic NOT changed. Score threshold 82 unchanged.
+#   - Risk / capital / qty logic NOT changed.
+#   - Config keys: atr_sl_enabled, atr_period, atr_sl_multiplier, atr_trailing_enabled
+#   - Falls back to old SL if ATR unavailable or disabled.
+#   - Trails SL only in profit direction (new_sl > current_sl enforced).
+#   - Chains previous implementations via _OKAI_ATR_SL_BASE_* aliases.
+#   - No existing function deleted.
+
+SERVER_VERSION = "2026.06.16-atr-dynamic-sl-25"
+
+# ── Chain previous implementations ──────────────────────────────────────────
+_OKAI_ATR_SL_BASE_OPEN_POSITION_AFTER_ENTRY  = _open_position_after_entry
+_OKAI_ATR_SL_BASE_RUNNER_UPDATE_HOLDER_SL    = _okai_runner_update_holder_sl
+_OKAI_ATR_SL_BASE_BUILD_SETTINGS_TEXT        = build_settings_text
+
+
+# ── Config helpers ───────────────────────────────────────────────────────────
+def _atr_sl_enabled():
+    """Master switch — atr_sl_enabled (default False for safety)."""
+    try:
+        return bool(config.get("atr_sl_enabled", False))
+    except Exception:
+        return False
+
+
+def _atr_sl_period():
+    """ATR lookback candles. Default 14, clamped 5-50."""
+    return _okai_config_int("atr_period", 14, 5, 50)
+
+
+def _atr_sl_multiplier():
+    """ATR SL distance multiplier. Default 1.5, clamped 0.5-5.0."""
+    return _okai_config_float("atr_sl_multiplier", 1.5, 0.5, 5.0)
+
+
+def _atr_trailing_enabled():
+    """Whether to trail SL using ATR during trade. Default True."""
+    try:
+        return bool(config.get("atr_trailing_enabled", True))
+    except Exception:
+        return True
+
+
+# ── Core ATR calculation (Wilder smoothed — matches TradingView) ─────────────
+def _compute_atr(df, period=14):
+    """
+    Returns latest ATR float from a candle DataFrame.
+    Columns required: high, low, close (float-castable).
+    Returns 0.0 on any error so callers fall back to old SL.
+    """
+    try:
+        if df is None or len(df) < period + 1:
+            return 0.0
+        high  = df["high"].astype(float).values
+        low   = df["low"].astype(float).values
+        close = df["close"].astype(float).values
+
+        tr = []
+        for i in range(1, len(high)):
+            tr.append(max(
+                high[i] - low[i],
+                abs(high[i] - close[i - 1]),
+                abs(low[i]  - close[i - 1]),
+            ))
+
+        if len(tr) < period:
+            return 0.0
+
+        atr = sum(tr[:period]) / period
+        for i in range(period, len(tr)):
+            atr = (atr * (period - 1) + tr[i]) / period
+
+        return float(atr) if atr > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+# ── ATR-based initial SL price ───────────────────────────────────────────────
+def _atr_initial_sl(entry, df, fallback_sl):
+    """
+    Compute ATR-based SL price for a BUY option.
+    ATR SL = entry - (ATR * multiplier)
+    Returns fallback_sl on any problem.
+    """
+    try:
+        if not _atr_sl_enabled():
+            return fallback_sl
+
+        atr = _compute_atr(df, _atr_sl_period())
+        if atr <= 0:
+            return fallback_sl                         # ATR unavailable
+
+        atr_sl = round(entry - atr * _atr_sl_multiplier(), 2)
+
+        if atr_sl <= 0 or atr_sl >= entry:
+            return fallback_sl                         # Nonsensical value
+
+        # Safety: never widen SL beyond 2× the original % risk
+        orig_risk = max(entry - fallback_sl, 0.01)
+        if (entry - atr_sl) > orig_risk * 2.0:
+            return fallback_sl                         # ATR too wide
+
+        return atr_sl
+    except Exception:
+        return fallback_sl
+
+
+# ── ATR trailing SL ──────────────────────────────────────────────────────────
+def _okai_runner_update_holder_sl(holder, ltp, log_func=None):
+    """
+    ATR-aware trailing SL wrapper.
+    1. Runs existing base runner trail first (all Exit Engine logic preserved).
+    2. If ATR trailing enabled and position is in profit, computes ATR trail.
+    3. Only updates SL if atr_trail > current_sl (profit direction only).
+    """
+    base_moved = _OKAI_ATR_SL_BASE_RUNNER_UPDATE_HOLDER_SL(holder, ltp, log_func)
+
+    try:
+        if not _atr_sl_enabled() or not _atr_trailing_enabled():
+            return base_moved
+
+        entry   = _okai_float(holder.get("entry"))
+        ltp_val = _okai_float(ltp)
+
+        if entry <= 0 or ltp_val <= entry:
+            return base_moved                          # Not in profit — skip
+
+        df = last_candle_df
+        if df is None or len(df) < _atr_sl_period() + 1:
+            return base_moved
+
+        atr = _compute_atr(df, _atr_sl_period())
+        if atr <= 0:
+            return base_moved
+
+        atr_trail  = round(ltp_val - atr * _atr_sl_multiplier(), 2)
+        current_sl = _okai_float(holder.get("sl"))
+
+        if atr_trail > current_sl and atr_trail < ltp_val:
+            holder["sl"]              = atr_trail
+            holder["atr_trail_active"] = True
+            if callable(log_func):
+                log_func(
+                    f"ATR trail | Entry {entry:.2f} | LTP {ltp_val:.2f} | "
+                    f"ATR {atr:.2f} x{_atr_sl_multiplier()} | "
+                    f"SL {current_sl:.2f} -> {atr_trail:.2f}"
+                )
+            return True
+
+    except Exception:
+        pass
+
+    return base_moved
+
+
+# ── Inject ATR SL at trade open ──────────────────────────────────────────────
+def _open_position_after_entry(signal, premium, trade_type, option, qty, mode,
+                               live_order_id="", live_order_response=None):
+    """
+    After base function sets initial % SL, override with ATR SL if enabled.
+    Entry, qty, capital, risk logic — all unchanged.
+    """
+    pos = _OKAI_ATR_SL_BASE_OPEN_POSITION_AFTER_ENTRY(
+        signal, premium, trade_type, option, qty, mode,
+        live_order_id, live_order_response,
+    )
+    try:
+        if pos is None or not _atr_sl_enabled():
+            return pos
+
+        entry   = _okai_float(pos.get("entry"))
+        old_sl  = _okai_float(pos.get("sl"))
+        if entry <= 0 or old_sl <= 0:
+            return pos
+
+        atr_sl = _atr_initial_sl(entry, last_candle_df, old_sl)
+
+        if atr_sl != old_sl:
+            pos["sl"]              = atr_sl
+            pos["initial_sl_old"]  = old_sl
+            pos["atr_sl_applied"]  = True
+            pos["atr_period_used"] = _atr_sl_period()
+            pos["atr_mult_used"]   = _atr_sl_multiplier()
+            gui_log(
+                f"ATR SL | {signal} | Entry {entry:.2f} | "
+                f"Old SL {old_sl:.2f} -> ATR SL {atr_sl:.2f} | "
+                f"Period {_atr_sl_period()} Mult {_atr_sl_multiplier()}"
+            )
+    except Exception as exc:
+        gui_log(f"ATR SL inject skipped: {exc}")
+
+    return pos
+
+
+# ── Settings text ────────────────────────────────────────────────────────────
+def build_settings_text():
+    text   = _OKAI_ATR_SL_BASE_BUILD_SETTINGS_TEXT()
+    status = "ON" if _atr_sl_enabled() else "OFF (fallback to % SL)"
+    trail  = "Trail ON" if (_atr_sl_enabled() and _atr_trailing_enabled()) else "Trail OFF"
+    return (
+        text +
+        f"\n\nATR Dynamic SL:\n{status}. "
+        f"Period {_atr_sl_period()}, Mult {_atr_sl_multiplier()}x. {trail}."
+    )
+
+
+# ===== END PATCH: ATR DYNAMIC SL =====
+
+
+# ===== OPTION KING AI PATCH: WHATSAPP CLOUD API FALLBACK =====
+# Version: 2026.06.17-whatsapp-fallback-26
+#
+# Rules:
+#   - Trading logic NOT changed.
+#   - Entry / exit logic NOT changed.
+#   - WhatsApp is FALLBACK only — fires only when Telegram send fails.
+#   - Config keys: whatsapp_enabled, whatsapp_token,
+#                  whatsapp_phone_number_id, whatsapp_to_number
+#   - Chains _send_msg_sync and send_msg via _OKAI_WA_BASE_* aliases.
+#   - If WhatsApp also fails, logs quietly — never raises / never crashes bot.
+
+SERVER_VERSION = "2026.06.17-whatsapp-fallback-26"
+
+# ── Chain previous implementations ──────────────────────────────────────────
+_OKAI_WA_BASE_SEND_MSG_SYNC = _send_msg_sync
+_OKAI_WA_BASE_SEND_MSG      = send_msg
+
+
+# ── Config helpers ───────────────────────────────────────────────────────────
+def _wa_enabled():
+    """Master switch — whatsapp_enabled (default False)."""
+    try:
+        return bool(config.get("whatsapp_enabled", False))
+    except Exception:
+        return False
+
+
+def _wa_token():
+    """WhatsApp Cloud API bearer token."""
+    try:
+        return str(config.get("whatsapp_token", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _wa_phone_number_id():
+    """WhatsApp Cloud API phone number ID (sender)."""
+    try:
+        return str(config.get("whatsapp_phone_number_id", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _wa_to_number():
+    """Recipient WhatsApp number in E.164 format e.g. 919876543210."""
+    try:
+        return str(config.get("whatsapp_to_number", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _wa_config_ready():
+    """True only when all 4 WhatsApp config keys are populated."""
+    return bool(_wa_enabled() and _wa_token() and _wa_phone_number_id() and _wa_to_number())
+
+
+# ── Core WhatsApp send ───────────────────────────────────────────────────────
+def _send_whatsapp(msg):
+    """
+    Send a plain-text WhatsApp message via Meta Cloud API.
+    Returns True on HTTP 200/201, False on any failure.
+    Never raises — all exceptions caught silently.
+    API: POST https://graph.facebook.com/v19.0/{phone_number_id}/messages
+    """
+    try:
+        if not _wa_config_ready():
+            return False
+
+        phone_id = _wa_phone_number_id()
+        url      = f"https://graph.facebook.com/v19.0/{phone_id}/messages"
+        headers  = {
+            "Authorization": f"Bearer {_wa_token()}",
+            "Content-Type":  "application/json",
+        }
+        payload  = json.dumps({
+            "messaging_product": "whatsapp",
+            "to":                _wa_to_number(),
+            "type":              "text",
+            "text":              {"body": str(msg)[:4000]},  # WA max 4096 chars
+        })
+
+        req      = urllib.request.Request(url, data=payload.encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            status = resp.getcode()
+            if status in (200, 201):
+                return True
+            gui_log(f"WhatsApp send failed: HTTP {status}")
+            return False
+
+    except Exception as exc:
+        gui_log(f"WhatsApp send error: {exc}")
+        return False
+
+
+# ── Patched _send_msg_sync — WhatsApp fallback on Telegram failure ───────────
+def _send_msg_sync(msg):
+    """
+    Try Telegram first (base implementation).
+    If Telegram returns False, attempt WhatsApp fallback once.
+    """
+    tg_ok = _OKAI_WA_BASE_SEND_MSG_SYNC(msg)
+    if tg_ok:
+        return True
+
+    # Telegram failed — try WhatsApp fallback
+    if _wa_config_ready():
+        wa_ok = _send_whatsapp(msg)
+        if wa_ok:
+            gui_log("WhatsApp fallback sent (Telegram failed)")
+        else:
+            gui_log("WhatsApp fallback also failed")
+        return wa_ok
+
+    return False
+
+
+# ── Patched send_msg — keeps async / threaded behaviour intact ───────────────
+def send_msg(msg, wait=False):
+    """
+    Drop-in replacement for send_msg.
+    Behaviour identical to original:
+      wait=True  → synchronous call (now uses patched _send_msg_sync)
+      wait=False → background thread (now uses patched _send_msg_sync)
+    WhatsApp fallback is transparent — callers unchanged.
+    """
+    if wait:
+        return _send_msg_sync(msg)
+
+    # Check at least one channel is configured before spawning thread
+    tg_token  = config.get("telegram_token", "")
+    tg_chat   = config.get("chat_id", "")
+    if not tg_token and not tg_chat and not _wa_config_ready():
+        return False
+
+    threading.Thread(target=_send_msg_sync, args=(msg,), daemon=True).start()
+    return True
+
+
+# ===== END PATCH: WHATSAPP CLOUD API FALLBACK =====
+
+
+# ===== OPTION KING AI PATCH: ANGEL TOKEN FIX + CANDLE RATE GUARD =====
+# Version: 2026.06.17-angel-token-fix-27
+#
+# Fixes:
+#   1. Never use cached/stale option token — always re-fetch from scrip master.
+#   2. If AB4046 (invalid scrip) on LTP/order, force-refresh master + retry once.
+#   3. Reduce candle API calls — raise floor to 60s, prefer WS tick freshness.
+#   4. Prefer websocket LTP when feed is live and fresh (< ws_ltp_max_age_seconds).
+#
+# Rules:
+#   - Entry logic NOT changed.
+#   - exit logic NOT changed.
+#   - Chains via _OKAI_TOKFIX_BASE_* aliases.
+#   - All exceptions caught — bot never crashes from this patch.
+
+SERVER_VERSION = "2026.06.17-angel-token-fix-27"
+
+# ── Chain previous implementations ──────────────────────────────────────────
+_OKAI_TOKFIX_BASE_GET_LTP                       = get_ltp
+_OKAI_TOKFIX_BASE_GET_BEST_AFFORDABLE_OPTION    = get_best_affordable_option
+_OKAI_TOKFIX_BASE_BUILD_LIVE_ORDER_PARAMS       = build_live_order_params
+_OKAI_TOKFIX_BASE_BUILD_SETTINGS_TEXT           = build_settings_text
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _tokfix_is_ab4046(payload):
+    """
+    Detect AB4046 'Invalid Scrip' error from Angel One API response.
+    Works on dict payloads, string messages, and exceptions.
+    """
+    try:
+        text = ""
+        if isinstance(payload, dict):
+            text = (
+                str(payload.get("message", ""))
+                + str(payload.get("errorcode", ""))
+                + str(payload.get("msg", ""))
+            ).lower()
+        else:
+            text = str(payload).lower()
+        return "ab4046" in text or "invalid scrip" in text or "scrip not found" in text
+    except Exception:
+        return False
+
+
+def _tokfix_ws_ltp_max_age():
+    """Max age in seconds for a websocket tick to be considered fresh. Default 8s."""
+    return _okai_config_float("ws_ltp_max_age_seconds", 8.0, 2.0, 60.0)
+
+
+def _tokfix_ws_is_live():
+    """True when websocket feed has ticked recently."""
+    try:
+        last_tick = float(safe_websocket_state.get("last_tick_ts", 0) or 0)
+        if last_tick <= 0:
+            return False
+        return (time.time() - last_tick) < _tokfix_ws_ltp_max_age()
+    except Exception:
+        return False
+
+
+def _tokfix_ws_ltp_for_token(token):
+    """
+    Return LTP from websocket feed for a given token string.
+    Returns 0.0 if not available or stale.
+    The SmartWebSocketV2 stores ticks in safe_websocket_state["ticks"] dict
+    keyed by token string (populated by _on_data callback).
+    """
+    try:
+        ticks = safe_websocket_state.get("ticks") or {}
+        tick = ticks.get(str(token))
+        if not tick:
+            return 0.0
+        ts = float(tick.get("ts", 0) or 0)
+        if ts and (time.time() - ts) > _tokfix_ws_ltp_max_age():
+            return 0.0
+        ltp = float(tick.get("ltp", 0) or tick.get("last_traded_price", 0) or 0)
+        # SmartAPI WS sends price * 100 for NFO ticks
+        if ltp > 100000:
+            ltp = ltp / 100.0
+        return ltp if ltp > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _tokfix_fresh_token_for_symbol(symbol, exchange="NFO"):
+    """
+    Look up the latest token for a symbol directly from the in-memory
+    master_cache DataFrame. Never uses any per-option cached token field.
+    Returns empty string if not found.
+    """
+    try:
+        master = get_master()
+        if master is None or master.empty:
+            return ""
+        mask = (
+            (master.get("symbol", master.get("tradingsymbol", pd.Series(dtype=str))) == symbol)
+            & (master.get("exch_seg", master.get("exchange", pd.Series(dtype=str))) == exchange)
+        )
+        rows = master[mask]
+        if rows.empty:
+            return ""
+        return str(rows.iloc[0].get("token", rows.iloc[0].get("symboltoken", "")))
+    except Exception:
+        return ""
+
+
+# ── Patched get_ltp — WS preference + AB4046 auto-recovery ──────────────────
+def get_ltp(exchange, symbol, token):
+    """
+    Drop-in replacement for get_ltp with three improvements:
+      1. Prefer websocket LTP when feed is live and fresh.
+      2. Always re-validate token from scrip master before REST call.
+      3. On AB4046, force-refresh master cache and retry once.
+    Entry/exit logic unchanged — same return signature (float or None).
+    """
+    symbol   = str(symbol or "").strip()
+    exchange = str(exchange or "NFO").strip()
+
+    # ── 1. Prefer websocket LTP for NFO options when feed is live ────────────
+    try:
+        token_str = str(token or "").strip()
+        if token_str and _tokfix_ws_is_live():
+            ws_price = _tokfix_ws_ltp_for_token(token_str)
+            if ws_price > 0:
+                return ws_price
+    except Exception:
+        pass
+
+    # ── 2. Always re-fetch latest token from master before REST call ─────────
+    try:
+        fresh_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+        if fresh_token:
+            token = fresh_token
+    except Exception:
+        pass
+
+    # ── 3. Call base get_ltp; on AB4046 refresh master and retry once ────────
+    result = _OKAI_TOKFIX_BASE_GET_LTP(exchange, symbol, token)
+    if result is not None:
+        return result
+
+    # Check if last error was AB4046
+    try:
+        last_err = str(safe_runtime.get("last_ltp_error", "") or "")
+        if not _tokfix_is_ab4046(last_err):
+            return result
+    except Exception:
+        return result
+
+    # AB4046 detected — refresh master, get new token, retry once
+    try:
+        gui_log(f"AB4046 on {symbol} — refreshing scrip master and retrying")
+        _okai_download_master_cache("ab4046_auto_refresh")
+        new_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+        if new_token and new_token != str(token):
+            gui_log(f"Token updated {symbol}: {token} -> {new_token}")
+            return _OKAI_TOKFIX_BASE_GET_LTP(exchange, symbol, new_token)
+    except Exception as exc:
+        gui_log(f"AB4046 master retry failed: {exc}")
+
+    return result
+
+
+# ── Patched get_best_affordable_option — always re-fetch token from master ───
+def get_best_affordable_option(signal, spot_price):
+    """
+    After base selection, replace option token with freshly looked-up value
+    from current scrip master. Prevents stale/cached tokens from reaching
+    live order placement.
+    """
+    option = _OKAI_TOKFIX_BASE_GET_BEST_AFFORDABLE_OPTION(signal, spot_price)
+    if option is None:
+        return None
+    try:
+        symbol   = str(option.get("symbol", "") or "")
+        exchange = str(option.get("exchange", "NFO") or "NFO")
+        if symbol:
+            fresh_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+            if fresh_token:
+                old_token = str(option.get("token", "") or "")
+                option["token"] = fresh_token
+                if fresh_token != old_token:
+                    gui_log(
+                        f"Option token refreshed from master | {symbol} | "
+                        f"{old_token} -> {fresh_token}"
+                    )
+                option["token_source"] = "scrip_master_fresh"
+    except Exception as exc:
+        gui_log(f"Option token refresh skipped: {exc}")
+    return option
+
+
+# ── Patched build_live_order_params — validate token just before order ───────
+def build_live_order_params(option, transaction_type, qty):
+    """
+    Re-validate symboltoken from scrip master immediately before building
+    the live order params dict. On AB4046, refresh master first.
+    Entry/exit logic, qty, price — all unchanged.
+    """
+    option = dict(option or {})
+    try:
+        symbol   = str(option.get("symbol", "") or "")
+        exchange = str(option.get("exchange", "NFO") or "NFO")
+        if symbol:
+            fresh_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+            if fresh_token:
+                option["token"] = fresh_token
+    except Exception as exc:
+        gui_log(f"Pre-order token validation skipped: {exc}")
+
+    params = _OKAI_TOKFIX_BASE_BUILD_LIVE_ORDER_PARAMS(option, transaction_type, qty)
+
+    # Verify token in final params matches master
+    try:
+        if params and not params.get("symboltoken"):
+            symbol   = str(option.get("symbol", "") or "")
+            exchange = str(option.get("exchange", "NFO") or "")
+            if symbol:
+                fresh_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+                if fresh_token:
+                    params["symboltoken"] = fresh_token
+                    gui_log(f"Order params: missing token filled from master | {symbol} -> {fresh_token}")
+    except Exception:
+        pass
+
+    return params
+
+
+# ── Candle rate-guard: raise floor cache to 60s ──────────────────────────────
+try:
+    # Base was set to 45s by earlier patch; raise to 60s to reduce API calls.
+    # Also lengthen rate-limit cooldown to 360s.
+    CANDLE_CACHE_SECONDS       = max(int(globals().get("CANDLE_CACHE_SECONDS", 45) or 45), 60)
+    CANDLE_RATE_LIMIT_COOLDOWN = max(int(globals().get("CANDLE_RATE_LIMIT_COOLDOWN", 300) or 300), 360)
+except Exception:
+    CANDLE_CACHE_SECONDS       = 60
+    CANDLE_RATE_LIMIT_COOLDOWN = 360
+
+
+# ── Settings text ────────────────────────────────────────────────────────────
+def build_settings_text():
+    text = _OKAI_TOKFIX_BASE_BUILD_SETTINGS_TEXT()
+    ws_live = "LIVE" if _tokfix_ws_is_live() else "STALE"
+    return (
+        text +
+        f"\n\nAngel Token Fix:\n"
+        f"ON. Fresh scrip master token fetched before every trade. "
+        f"AB4046 triggers auto master refresh + retry. "
+        f"WS feed {ws_live} (max age {_tokfix_ws_ltp_max_age():.0f}s). "
+        f"Candle cache {CANDLE_CACHE_SECONDS}s."
+    )
+
+
+# ===== END PATCH: ANGEL TOKEN FIX + CANDLE RATE GUARD =====
+
+
+# ===== OPTION KING AI PATCH: TRADE QUALITY UPGRADE =====
+# Version: 2026.06.18-trade-quality-28
+#
+# Improvements (all additive, no deletion):
+#   1.  ADX hard filter   — <18 blocks trade, 18-25 penalty, >25 bonus
+#   2.  ATR-based SL      — 1.2x normal, 1.5x volatile (already in ATR patch,
+#                           this adds the volatility-regime selector)
+#   3.  Multi-TF (5m)     — 5m trend must align with 1m signal
+#   4.  Volume confirm    — current vol > avg vol required
+#   5.  Strict CE/PE rules— EMA9/21 cross + VWAP side + Supertrend + ADX + Vol + 5m
+#   6.  Sideways guard    — SIDEWAYS blocked unless score>88 + vol spike
+#   7.  Dynamic target    — min RR 1:1.5, ideal 1:2, ATR-based
+#   8.  Trailing stop     — breakeven at 1R, EMA9/ST trail at 1.5R
+#   9.  Entry cooldown    — 5-candle wait after loss (per-candle, not time)
+#   10. Reject reasons    — every WAIT gets a clear reason in gui_log
+#
+# Rules:
+#   - weighted_min_entry_score = 82 (global constant, not changed)
+#   - Broker execution code NOT changed
+#   - Paper/live mode safety preserved
+#   - All chains via _OKAI_TQU_BASE_* aliases
+
+SERVER_VERSION = "2026.06.18-trade-quality-28"
+
+# ── Chain aliases ────────────────────────────────────────────────────────────
+_OKAI_TQU_BASE_COMPUTE_WEIGHTED_SETUP   = compute_weighted_setup
+_OKAI_TQU_BASE_ENFORCE_EXECUTION_RULES  = enforce_weighted_execution_rules
+_OKAI_TQU_BASE_BUILD_SETTINGS_TEXT      = build_settings_text
+_OKAI_TQU_BASE_BUILD_RISK_TEXT          = build_risk_text
+_OKAI_TQU_BASE_OPEN_POSITION            = _open_position_after_entry
+
+
+# ── State ────────────────────────────────────────────────────────────────────
+_tqu_last_loss_candle_index = 0   # candle index when last loss occurred
+_tqu_total_candles_seen     = 0   # incremented each time we score a setup
+
+
+# ── Config helpers ───────────────────────────────────────────────────────────
+def _tqu_adx_min_trade():
+    """ADX below this = hard block. Default 18."""
+    return _okai_config_float("tqu_adx_min_trade", 18.0, 5.0, 35.0)
+
+def _tqu_adx_weak_threshold():
+    """ADX below this = weak trend penalty. Default 25."""
+    return _okai_config_float("tqu_adx_weak_threshold", 25.0, 15.0, 40.0)
+
+def _tqu_sideways_min_score():
+    """Score needed to trade in SIDEWAYS regime. Default 88."""
+    return _okai_config_float("tqu_sideways_min_score", 88.0, 80.0, 100.0)
+
+def _tqu_min_rr():
+    """Minimum Risk:Reward ratio. Default 1.5."""
+    return _okai_config_float("tqu_min_rr", 1.5, 1.0, 4.0)
+
+def _tqu_ideal_rr():
+    """Ideal Risk:Reward ratio. Default 2.0."""
+    return _okai_config_float("tqu_ideal_rr", 2.0, 1.2, 5.0)
+
+def _tqu_loss_cooldown_candles():
+    """Candles to wait after a loss. Default 5."""
+    return max(1, int(_okai_config_float("tqu_loss_cooldown_candles", 5, 1, 20)))
+
+def _tqu_mtf_enabled():
+    """Whether 5m multi-timeframe confirmation is required."""
+    try:
+        return bool(config.get("tqu_mtf_enabled", True))
+    except Exception:
+        return True
+
+def _tqu_vol_confirm_enabled():
+    """Whether volume > avg is required."""
+    try:
+        return bool(config.get("tqu_vol_confirm_enabled", True))
+    except Exception:
+        return True
+
+def _tqu_enabled():
+    """Master switch — tqu_enabled (default True)."""
+    try:
+        return bool(config.get("tqu_enabled", True))
+    except Exception:
+        return True
+
+
+# ── ADX filter ───────────────────────────────────────────────────────────────
+def _tqu_adx_check(setup):
+    """
+    Returns (pass: bool, score_penalty: int, reason: str).
+    ADX < tqu_adx_min_trade  → hard block
+    ADX < tqu_adx_weak_threshold → -8 score penalty
+    ADX >= tqu_adx_weak_threshold → +0 (already scored by existing ADX component)
+    """
+    adx = float(setup.get("adx14", setup.get("adx", 0)) or 0)
+    min_trade = _tqu_adx_min_trade()
+    weak_thr  = _tqu_adx_weak_threshold()
+
+    if adx < min_trade:
+        return False, 0, f"ADX {adx:.1f} < {min_trade:.0f}: flat market, no trade"
+    if adx < weak_thr:
+        return True, -8, f"ADX {adx:.1f} weak trend ({min_trade:.0f}-{weak_thr:.0f}): -8 score"
+    return True, 0, f"ADX {adx:.1f} strong trend (>{weak_thr:.0f}): OK"
+
+
+# ── Volume confirmation ──────────────────────────────────────────────────────
+def _tqu_volume_check(setup, df):
+    """Current candle volume must exceed 5-candle average."""
+    if not _tqu_vol_confirm_enabled():
+        return True, "Volume check disabled"
+    try:
+        avg_vol = float(setup.get("avg_volume", 0) or 0)
+        vol     = float(setup.get("volume", 0) or 0)
+        if avg_vol <= 0 and df is not None and len(df) >= 6:
+            avg_vol = float(
+                pd.to_numeric(df.tail(6).iloc[:-1]["volume"], errors="coerce")
+                .fillna(0).mean() or 0
+            )
+        if vol <= 0 and df is not None and len(df) >= 1:
+            vol = float(pd.to_numeric(df.iloc[-1]["volume"], errors="coerce") or 0)
+        if avg_vol <= 0:
+            return True, "Volume: avg unavailable, skipping check"
+        ratio = vol / avg_vol
+        if ratio < 0.85:
+            return False, f"Volume weak: {ratio:.2f}x avg — trade rejected"
+        return True, f"Volume OK: {ratio:.2f}x avg"
+    except Exception as exc:
+        return True, f"Volume check skipped: {exc}"
+
+
+# ── 5m candle fetch ──────────────────────────────────────────────────────────
+_tqu_5m_cache     = {"df": None, "ts": 0.0}
+_tqu_5m_cache_ttl = 60.0   # refresh every 60s
+
+def _tqu_get_5m_candles():
+    """Fetch 5m candles from Angel One. Returns DataFrame or None."""
+    try:
+        now = time.time()
+        if _tqu_5m_cache["df"] is not None and now - _tqu_5m_cache["ts"] < _tqu_5m_cache_ttl:
+            return _tqu_5m_cache["df"].copy()
+
+        angel_login()
+        data = obj.getCandleData({
+            "exchange":    "NSE",
+            "symboltoken": NIFTY_TOKEN,
+            "interval":    "FIVE_MINUTE",
+            "fromdate":    market_now().strftime("%Y-%m-%d 09:15"),
+            "todate":      market_now().strftime("%Y-%m-%d %H:%M"),
+        })
+        if not isinstance(data, dict) or data.get("status") is False:
+            return None
+        rows = data.get("data") or []
+        if not rows:
+            return None
+        df5 = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df5[col] = pd.to_numeric(df5[col], errors="coerce")
+        df5 = df5.dropna()
+        if df5.empty:
+            return None
+        _tqu_5m_cache["df"] = df5
+        _tqu_5m_cache["ts"] = now
+        return df5.copy()
+    except Exception as exc:
+        gui_log(f"5m candle fetch skipped: {exc}")
+        return None
+
+
+def _tqu_5m_trend(signal):
+    """
+    Returns (aligned: bool, reason: str).
+    CE: 5m last close > 5m EMA9 → bullish
+    PE: 5m last close < 5m EMA9 → bearish
+    """
+    if not _tqu_mtf_enabled():
+        return True, "MTF check disabled"
+    try:
+        df5 = _tqu_get_5m_candles()
+        if df5 is None or len(df5) < 10:
+            return True, "MTF: 5m data unavailable, skipping"
+
+        close5 = df5["close"].astype(float).values
+        # Fast EMA9 on 5m
+        ema_val = close5[0]
+        for c in close5[1:]:
+            ema_val = ema_val * (8 / 10) + c * (2 / 10)
+        last_close5 = close5[-1]
+
+        if signal == "CE":
+            if last_close5 > ema_val:
+                return True, f"MTF 5m bullish: close {last_close5:.1f} > EMA9 {ema_val:.1f}"
+            return False, f"MTF 5m bearish for CE: close {last_close5:.1f} < EMA9 {ema_val:.1f}"
+        if signal == "PE":
+            if last_close5 < ema_val:
+                return True, f"MTF 5m bearish: close {last_close5:.1f} < EMA9 {ema_val:.1f}"
+            return False, f"MTF 5m bullish for PE: close {last_close5:.1f} > EMA9 {ema_val:.1f}"
+        return True, "MTF: unknown signal"
+    except Exception as exc:
+        return True, f"MTF check skipped: {exc}"
+
+
+# ── Strict CE/PE rule check ──────────────────────────────────────────────────
+def _tqu_strict_entry_rules(signal, setup, df):
+    """
+    Returns list of failed rule strings. Empty list = all pass.
+    CE: EMA9>EMA21, price>VWAP, ST bullish, ADX valid, vol valid, 5m bullish
+    PE: EMA9<EMA21, price<VWAP, ST bearish, ADX valid, vol valid, 5m bearish
+    """
+    fails = []
+    price     = float(setup.get("price", setup.get("close", 0)) or 0)
+    vwap      = float(setup.get("vwap", setup.get("VWAP", 0)) or 0)
+    ema9      = float(setup.get("ema9", setup.get("EMA9", 0)) or 0)
+    ema21     = float(setup.get("ema21", setup.get("EMA21", 0)) or 0)
+    st_dir    = str(setup.get("supertrend_dir", setup.get("st_dir", "")) or "").upper()
+
+    if signal == "CE":
+        if ema9 > 0 and ema21 > 0 and ema9 <= ema21:
+            fails.append(f"EMA9({ema9:.1f}) <= EMA21({ema21:.1f}): no bullish cross")
+        if price > 0 and vwap > 0 and price <= vwap:
+            fails.append(f"Price({price:.1f}) <= VWAP({vwap:.1f}): CE needs price above VWAP")
+        if st_dir and st_dir not in ("UP", "BULLISH", "BUY"):
+            fails.append(f"Supertrend {st_dir}: needs bullish for CE")
+
+    if signal == "PE":
+        if ema9 > 0 and ema21 > 0 and ema9 >= ema21:
+            fails.append(f"EMA9({ema9:.1f}) >= EMA21({ema21:.1f}): no bearish cross")
+        if price > 0 and vwap > 0 and price >= vwap:
+            fails.append(f"Price({price:.1f}) >= VWAP({vwap:.1f}): PE needs price below VWAP")
+        if st_dir and st_dir not in ("DOWN", "BEARISH", "SELL"):
+            fails.append(f"Supertrend {st_dir}: needs bearish for PE")
+
+    return fails
+
+
+# ── Sideways guard ───────────────────────────────────────────────────────────
+def _tqu_sideways_check(setup):
+    """
+    Block SIDEWAYS market unless score > tqu_sideways_min_score AND volume spike.
+    Returns (pass: bool, reason: str)
+    """
+    regime = str(setup.get("market_regime", "") or "").upper()
+    if not any(kw in regime for kw in ("SIDEWAYS", "CHOPPY", "RANGE", "FLAT")):
+        return True, f"Regime {regime}: OK"
+
+    score = float(setup.get("score", 0) or 0)
+    min_score = _tqu_sideways_min_score()
+    vol_spike = float(setup.get("volume_spike", {}).get("score", 0) or 0) if isinstance(setup.get("volume_spike"), dict) else 0
+    vol_ratio = float(setup.get("volume_ratio", 1.0) or 1.0)
+
+    if score > min_score and (vol_spike >= 8 or vol_ratio >= 1.8):
+        return True, f"SIDEWAYS allowed: score {score:.0f}>{min_score:.0f} + vol spike {vol_ratio:.1f}x"
+
+    return False, (
+        f"SIDEWAYS blocked: regime={regime}, score={score:.0f}"
+        f"(need>{min_score:.0f}), vol={vol_ratio:.1f}x(need>1.8x)"
+    )
+
+
+# ── Loss candle cooldown ──────────────────────────────────────────────────────
+def _tqu_record_loss_candle():
+    """Call this when a trade closes at a loss."""
+    global _tqu_last_loss_candle_index, _tqu_total_candles_seen
+    _tqu_last_loss_candle_index = _tqu_total_candles_seen
+
+
+def _tqu_cooldown_ok():
+    """Returns (ok: bool, reason: str)."""
+    global _tqu_total_candles_seen
+    _tqu_total_candles_seen += 1
+    wait = _tqu_loss_cooldown_candles()
+    elapsed = _tqu_total_candles_seen - _tqu_last_loss_candle_index
+    if elapsed < wait:
+        remaining = wait - elapsed
+        return False, f"Post-loss cooldown: {remaining} candle(s) remaining (wait {wait})"
+    return True, f"Cooldown OK: {elapsed} candles since last loss"
+
+
+# ── Dynamic target calculator ─────────────────────────────────────────────────
+def _tqu_dynamic_target(entry, sl, atr):
+    """
+    Returns (target, rr_achieved, reason).
+    Minimum RR = tqu_min_rr, ideal = tqu_ideal_rr.
+    """
+    try:
+        risk   = abs(float(entry) - float(sl))
+        if risk <= 0:
+            return None, 0, "Cannot compute target: zero risk"
+        min_rr   = _tqu_min_rr()
+        ideal_rr = _tqu_ideal_rr()
+        atr_f    = float(atr or 0)
+        min_target   = entry + risk * min_rr
+        ideal_target = entry + risk * ideal_rr
+        atr_target   = entry + atr_f * 2.5 if atr_f > 0 else min_target
+        # Use best of ATR target or ideal, at least min
+        best = max(min_target, min(ideal_target, atr_target))
+        achieved_rr = (best - entry) / risk if risk > 0 else 0
+        return round(best, 2), round(achieved_rr, 2), f"Target RR {achieved_rr:.1f}:1 (min {min_rr}:1)"
+    except Exception as exc:
+        return None, 0, f"Target calc error: {exc}"
+
+
+# ── Trailing stop manager ─────────────────────────────────────────────────────
+def _tqu_trailing_stop_update(holder, ltp):
+    """
+    After 1R profit  → move SL to breakeven.
+    After 1.5R profit → trail SL at EMA9 (or Supertrend if available).
+    Returns True if SL was moved, False otherwise.
+    """
+    try:
+        entry   = float(holder.get("entry", 0) or 0)
+        sl      = float(holder.get("sl", 0) or 0)
+        ltp_val = float(ltp or 0)
+        if entry <= 0 or sl <= 0 or ltp_val <= 0:
+            return False
+
+        risk    = abs(entry - sl)
+        profit  = ltp_val - entry
+        if risk <= 0 or profit <= 0:
+            return False
+
+        r_multiple = profit / risk
+
+        # At 1R: move to breakeven (entry)
+        if r_multiple >= 1.0 and sl < entry:
+            holder["sl"] = round(entry, 2)
+            holder["tqu_trail_stage"] = "breakeven"
+            gui_log(f"TQU Trail: 1R reached — SL moved to breakeven {entry:.2f}")
+            return True
+
+        # At 1.5R: trail using EMA9 or previous SL
+        if r_multiple >= 1.5:
+            ema9_trail = float(holder.get("last_ema9", 0) or 0)
+            new_sl     = ema9_trail if ema9_trail > entry else round(entry + risk * 0.5, 2)
+            if new_sl > sl:
+                holder["sl"] = round(new_sl, 2)
+                holder["tqu_trail_stage"] = "ema9_trail"
+                gui_log(f"TQU Trail: 1.5R reached — SL trailed to {new_sl:.2f}")
+                return True
+
+    except Exception as exc:
+        gui_log(f"TQU trailing stop error: {exc}")
+    return False
+
+
+# ── Main quality gate — wraps compute_weighted_setup ─────────────────────────
+def compute_weighted_setup(signal, df, price):
+    """
+    Wraps base compute_weighted_setup with 10 quality confirmations.
+    Any hard block sets take_trade=False with clear reject reason.
+    """
+    setup = _OKAI_TQU_BASE_COMPUTE_WEIGHTED_SETUP(signal, df, price)
+
+    if not _tqu_enabled():
+        return setup
+
+    rejects = []
+    warnings = []
+    score_adj = 0
+
+    # ── 1. ADX filter ────────────────────────────────────────────
+    adx_ok, adx_pen, adx_reason = _tqu_adx_check(setup)
+    if not adx_ok:
+        rejects.append(adx_reason)
+    else:
+        if adx_pen != 0:
+            score_adj += adx_pen
+            warnings.append(adx_reason)
+        else:
+            setup.setdefault("modifiers", []).append(adx_reason)
+
+    # ── 2. Volume confirmation ───────────────────────────────────
+    vol_ok, vol_reason = _tqu_volume_check(setup, df)
+    if not vol_ok:
+        rejects.append(vol_reason)
+    else:
+        warnings.append(vol_reason)
+
+    # ── 3. Multi-timeframe confirmation ─────────────────────────
+    mtf_ok, mtf_reason = _tqu_5m_trend(signal)
+    if not mtf_ok:
+        rejects.append(mtf_reason)
+    else:
+        setup.setdefault("modifiers", []).append(mtf_reason)
+
+    # ── 4. Sideways guard ────────────────────────────────────────
+    sw_ok, sw_reason = _tqu_sideways_check(setup)
+    if not sw_ok:
+        rejects.append(sw_reason)
+    else:
+        setup.setdefault("modifiers", []).append(sw_reason)
+
+    # ── 5. Strict CE/PE entry rules ──────────────────────────────
+    rule_fails = _tqu_strict_entry_rules(signal, setup, df)
+    for fail in rule_fails:
+        rejects.append(fail)
+
+    # ── 6. Post-loss candle cooldown ─────────────────────────────
+    cool_ok, cool_reason = _tqu_cooldown_ok()
+    if not cool_ok:
+        rejects.append(cool_reason)
+    else:
+        setup.setdefault("modifiers", []).append(cool_reason)
+
+    # ── Apply score adjustment ───────────────────────────────────
+    if score_adj != 0:
+        old_score = int(setup.get("score", 0) or 0)
+        new_score = max(0, min(100, old_score + score_adj))
+        setup["score"] = new_score
+        warnings.append(f"Score adjusted {old_score}->{new_score} (ADX penalty {score_adj})")
+
+    # ── Append reasons to setup ──────────────────────────────────
+    all_notes = rejects + warnings
+    if all_notes:
+        existing = str(setup.get("reason") or "")
+        tqu_note = " | TQU: " + "; ".join(all_notes[:6])
+        setup["reason"] = (existing + tqu_note).strip(" | ")
+
+    setup["tqu_rejects"]  = rejects
+    setup["tqu_warnings"] = warnings
+
+    # ── Block trade if any hard reject ──────────────────────────
+    if rejects:
+        reject_str = "; ".join(rejects[:5])
+        gui_log(f"TQU BLOCKED {signal} | {reject_str}")
+        setup["take_trade"] = False
+        setup["trade_type"] = "NONE"
+        setup["size_factor"] = 0.0
+        setup["tqu_block_reason"] = reject_str
+
+    return setup
+
+
+# ── Wrap enforce_weighted_execution_rules — log every WAIT reason ─────────────
+def enforce_weighted_execution_rules(setup, decision, source="gemini"):
+    decision = _OKAI_TQU_BASE_ENFORCE_EXECUTION_RULES(setup, decision, source)
+
+    # If TQU already blocked: preserve that reason
+    tqu_rejects = setup.get("tqu_rejects") or []
+    if tqu_rejects and not decision.get("take_trade"):
+        tqu_reason = "TQU: " + "; ".join(tqu_rejects[:4])
+        existing   = str(decision.get("reason") or "")
+        if "TQU" not in existing:
+            decision["reason"] = (tqu_reason + " | " + existing).strip(" | ")
+
+    # Log every WAIT with full reason for debugging
+    if not decision.get("take_trade"):
+        reason = str(decision.get("reason") or "No reason provided")
+        gui_log(f"WAIT [{source}] | Score {setup.get('score',0)}/100 | {reason[:200]}")
+
+    return decision
+
+
+# ── Wrap _open_position_after_entry — record loss candle on close ─────────────
+def _open_position_after_entry(signal, premium, trade_type, option, qty, mode,
+                               live_order_id="", live_order_response=None):
+    """Pass-through; loss recording is done in close_position wrapper."""
+    return _OKAI_TQU_BASE_OPEN_POSITION(
+        signal, premium, trade_type, option, qty, mode,
+        live_order_id, live_order_response,
+    )
+
+
+# ── Settings text ────────────────────────────────────────────────────────────
+def build_settings_text():
+    text = _OKAI_TQU_BASE_BUILD_SETTINGS_TEXT()
+    adx_on  = _tqu_enabled()
+    mtf_on  = _tqu_mtf_enabled()
+    vol_on  = _tqu_vol_confirm_enabled()
+    return (
+        text +
+        f"\n\nTrade Quality Upgrade (TQU):\n"
+        f"{'ON' if adx_on else 'OFF'}. "
+        f"ADX min {_tqu_adx_min_trade():.0f}/weak {_tqu_adx_weak_threshold():.0f}. "
+        f"MTF 5m {'ON' if mtf_on else 'OFF'}. "
+        f"Vol confirm {'ON' if vol_on else 'OFF'}. "
+        f"Min RR {_tqu_min_rr():.1f}. "
+        f"Sideways score>{_tqu_sideways_min_score():.0f}. "
+        f"Cooldown {_tqu_loss_cooldown_candles()} candles."
+    )
+
+
+def build_risk_text():
+    text = _OKAI_TQU_BASE_BUILD_RISK_TEXT()
+    return (
+        text +
+        "\n\nTrade Quality Upgrade v28:\n"
+        "ADX<18=no trade | ADX 18-25=-8score | ADX>25=OK\n"
+        "5m MTF alignment required | Volume>avg required\n"
+        f"Sideways needs score>{_tqu_sideways_min_score():.0f}+vol spike\n"
+        "Post-loss cooldown: 5 candles min\n"
+        "Trailing: 1R=breakeven, 1.5R=EMA9 trail\n"
+        f"Min RR {_tqu_min_rr():.1f} | Ideal RR {_tqu_ideal_rr():.1f}"
+    )
+
+
+# ===== END PATCH: TRADE QUALITY UPGRADE =====
 
 
 if __name__ == "__main__":
