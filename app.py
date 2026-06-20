@@ -21488,5 +21488,544 @@ def build_risk_text():
 # ===== END PATCH: TRADE QUALITY UPGRADE =====
 
 
+# ===== OPTION KING AI PATCH: LIVE SAFETY HARD BLOCKS =====
+# Version: 2026.06.20-live-safety-29
+#
+# Safety-only layer:
+# - No indicator changes.
+# - No main strategy changes.
+# - No exit engine changes.
+# - Weighted LIVE approval floor stays 82.
+
+SERVER_VERSION = "2026.06.20-live-safety-29"
+
+LIVE_SAFETY_MIN_WEIGHTED_SCORE = 82
+LIVE_SAFETY_MAX_TRADES_PER_DAY = 5
+LIVE_SAFETY_MAX_LOSSES_PER_DAY = 3
+LIVE_SAFETY_LOSS_COOLDOWN_SECONDS = 15 * 60
+LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT = 50.0
+
+_OKAI_LIVE_SAFETY_BASE_APPLY_RUNTIME = apply_live_strategy_runtime_settings
+_OKAI_LIVE_SAFETY_BASE_ENFORCE_WEIGHTED = enforce_weighted_execution_rules
+_OKAI_LIVE_SAFETY_BASE_BUILD_TRADE_QUALITY = _okai_build_trade_quality
+_OKAI_LIVE_SAFETY_BASE_PLACE_PAPER_TRADE = place_paper_trade
+_OKAI_LIVE_SAFETY_BASE_PLACE_LIVE_ORDER = place_live_order
+_OKAI_LIVE_SAFETY_BASE_OPEN_POSITION = _open_position_after_entry
+_OKAI_LIVE_SAFETY_BASE_CLOSE_POSITION = close_position
+_OKAI_LIVE_SAFETY_BASE_TRADE_LIMITS = safety_trade_limits_block_reason
+_OKAI_LIVE_SAFETY_BASE_EXPIRY_CAPITAL_USE_PERCENT = expiry_capital_use_percent
+_OKAI_LIVE_SAFETY_BASE_EXPIRY_AFTER_LOSS_QTY_PERCENT = expiry_after_loss_qty_percent
+_OKAI_LIVE_SAFETY_BASE_STATUS_PAYLOAD = status_payload
+_OKAI_LIVE_SAFETY_BASE_BUILD_RISK_TEXT = build_risk_text
+
+
+def _live_safety_now_ts():
+    try:
+        return time.time()
+    except Exception:
+        return 0.0
+
+
+def _live_safety_today_text():
+    try:
+        return market_day_text()
+    except Exception:
+        try:
+            return market_now().strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+
+def _live_safety_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _live_safety_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return int(default)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _live_safety_is_live_entry():
+    try:
+        return bool(is_live_mode() and live_trading_enabled())
+    except Exception:
+        return False
+
+
+def _live_safety_log_block(reason, signal="", trade_type="", option=None):
+    signal_text = str(signal or "").upper() or "LIVE"
+    trade_text = str(trade_type or "").upper() or "ENTRY"
+    reason_text = str(reason or "blocked").strip()
+    safe_runtime["live_safety_last_block"] = reason_text
+    gui_log(f"LIVE SAFETY BLOCK | {signal_text} {trade_text} | {reason_text}")
+    try:
+        update_trade_suggestion(
+            None,
+            "NONE",
+            globals().get("last_score", 0),
+            0,
+            f"LIVE safety blocked: {reason_text}",
+            globals().get("last_nifty_price", None),
+            option,
+        )
+    except Exception:
+        pass
+    try:
+        safe_append_event("LIVE_SAFETY_BLOCKED", {
+            "signal": signal_text,
+            "trade_type": trade_text,
+            "reason": reason_text,
+            "option": option or {},
+            "timestamp": market_now().isoformat(timespec="seconds"),
+        })
+    except Exception:
+        pass
+
+
+def _live_safety_today_live_rows():
+    today = _live_safety_today_text()
+    rows = []
+    for trade in list(globals().get("trade_history", []) or []):
+        try:
+            if str(trade.get("date", "")) != today:
+                continue
+            if str(trade.get("mode", "") or "").strip().upper() != "LIVE":
+                continue
+            rows.append(trade)
+        except Exception:
+            continue
+    return rows
+
+
+def _live_safety_reset_runtime_day():
+    today = _live_safety_today_text()
+    if safe_runtime.get("live_safety_day") != today:
+        rows = _live_safety_today_live_rows()
+        losses = 0
+        for trade in rows:
+            pnl = _live_safety_float(trade.get("pnl", trade.get("net_pnl")), 0.0)
+            if pnl < 0:
+                losses += 1
+        safe_runtime["live_safety_day"] = today
+        safe_runtime["live_safety_entry_count"] = len(rows)
+        safe_runtime["live_safety_loss_count"] = losses
+        safe_runtime["live_safety_loss_cooldown_until"] = 0.0
+        if str(safe_runtime.get("daily_stop_reason", "")).startswith("LIVE safety:"):
+            safe_runtime["daily_stop_reason"] = ""
+
+
+def _live_safety_today_trade_count():
+    _live_safety_reset_runtime_day()
+    closed_count = len(_live_safety_today_live_rows())
+    runtime_count = _live_safety_int(safe_runtime.get("live_safety_entry_count"), closed_count)
+    count = max(closed_count, runtime_count, _live_safety_int(globals().get("trades_taken", 0), 0))
+    try:
+        if position is not None and str(position.get("mode", "") or "").upper() == "LIVE":
+            if str(position.get("entry_date", _live_safety_today_text())) == _live_safety_today_text():
+                count = max(count, closed_count + 1)
+    except Exception:
+        pass
+    return count
+
+
+def _live_safety_today_loss_count():
+    losses = 0
+    for trade in _live_safety_today_live_rows():
+        pnl = _live_safety_float(trade.get("pnl", trade.get("net_pnl")), 0.0)
+        if pnl < 0:
+            losses += 1
+    runtime_losses = _live_safety_int(safe_runtime.get("live_safety_loss_count"), losses)
+    return max(losses, runtime_losses)
+
+
+def _live_safety_parse_trade_ts(trade):
+    try:
+        date_text = str(trade.get("date") or _live_safety_today_text())
+        time_text = str(trade.get("exit_time") or trade.get("time") or "")
+        if not date_text or not time_text:
+            return 0.0
+        stamp = dt.datetime.fromisoformat(f"{date_text}T{time_text}")
+        return stamp.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _live_safety_latest_loss_ts():
+    latest = 0.0
+    for trade in _live_safety_today_live_rows():
+        pnl = _live_safety_float(trade.get("pnl", trade.get("net_pnl")), 0.0)
+        if pnl < 0:
+            latest = max(latest, _live_safety_parse_trade_ts(trade))
+    return max(latest, _live_safety_float(safe_runtime.get("live_safety_last_loss_ts"), 0.0))
+
+
+def _live_safety_trade_limit_block_reason():
+    _live_safety_reset_runtime_day()
+    now = _live_safety_now_ts()
+    cooldown_until = max(
+        _live_safety_float(safe_runtime.get("live_safety_loss_cooldown_until"), 0.0),
+        _live_safety_latest_loss_ts() + LIVE_SAFETY_LOSS_COOLDOWN_SECONDS,
+    )
+    if cooldown_until > now:
+        remaining = int(cooldown_until - now)
+        return f"15-minute LIVE loss cooldown active ({remaining}s left)"
+
+    losses = _live_safety_today_loss_count()
+    if losses >= LIVE_SAFETY_MAX_LOSSES_PER_DAY:
+        reason = f"LIVE safety: stopped after {losses} LIVE losses today"
+        safe_runtime["daily_stop_reason"] = reason
+        return reason
+
+    trades = _live_safety_today_trade_count()
+    if trades >= LIVE_SAFETY_MAX_TRADES_PER_DAY:
+        return f"LIVE max trades reached ({trades}/{LIVE_SAFETY_MAX_TRADES_PER_DAY})"
+    return ""
+
+
+def _live_safety_score_for_entry(signal=""):
+    decision = globals().get("last_weighted_decision")
+    if isinstance(decision, dict):
+        score = _live_safety_int(decision.get("score"), -1)
+        if score >= 0:
+            return score, "last_weighted_decision"
+    context = globals().get("last_intelligence_context")
+    if isinstance(context, dict):
+        score = _live_safety_int(context.get("weighted_score", context.get("score")), -1)
+        if score >= 0:
+            return score, "last_intelligence_context"
+    return _live_safety_int(globals().get("last_score", 0), 0), "last_score"
+
+
+def _live_safety_score_block_reason(signal=""):
+    score, source = _live_safety_score_for_entry(signal)
+    if score < LIVE_SAFETY_MIN_WEIGHTED_SCORE:
+        return f"weighted score {score}<82 ({source}); LIVE entry blocked"
+    return ""
+
+
+def _live_safety_websocket_block_reason():
+    try:
+        if not bool(config.get("websocket_feed_enabled", True)):
+            return "websocket feed disabled; LIVE entry blocked"
+    except Exception:
+        pass
+    try:
+        if callable(globals().get("_tokfix_ws_is_live")) and not _tokfix_ws_is_live():
+            last_tick = _live_safety_float(safe_websocket_state.get("last_tick_ts"), 0.0)
+            age = int(_live_safety_now_ts() - last_tick) if last_tick else -1
+            status = str(safe_websocket_state.get("status") or "unknown")
+            return f"websocket stale/missing ({status}, age {age}s)"
+    except Exception as exc:
+        return f"websocket freshness check failed: {str(exc)[:80]}"
+    return ""
+
+
+def _live_safety_candle_block_reason():
+    try:
+        if last_candle_df is None or getattr(last_candle_df, "empty", True):
+            return "candle data missing"
+        if not last_candle_fetch_time:
+            return "candle timestamp missing"
+        max_age = _live_safety_float(
+            config.get("live_safety_max_candle_age_seconds", ENTRY_MAX_CANDLE_AGE_SECONDS),
+            ENTRY_MAX_CANDLE_AGE_SECONDS,
+        )
+        age = _live_safety_now_ts() - _live_safety_float(last_candle_fetch_time, 0.0)
+        if age > max_age:
+            return f"candle data stale {int(age)}s>{int(max_age)}s"
+    except Exception as exc:
+        return f"candle freshness check failed: {str(exc)[:80]}"
+    return ""
+
+
+def _live_safety_index_ltp_block_reason():
+    try:
+        price = _live_safety_float(globals().get("last_nifty_price"), 0.0)
+        if price <= 0:
+            latest = get_nifty_price()
+            price = _live_safety_float(latest, 0.0)
+        if price <= 0:
+            return "index LTP missing"
+        safe_runtime["live_safety_last_index_ltp"] = price
+        safe_runtime["live_safety_last_index_ltp_ts"] = _live_safety_now_ts()
+    except Exception as exc:
+        return f"index LTP unavailable: {str(exc)[:80]}"
+    return ""
+
+
+def _live_safety_option_token_block_reason(option):
+    option = option or {}
+    exchange, symbol, token = _okai_option_symbol_token(option)
+    if not symbol:
+        return "option symbol missing"
+    if not token:
+        return f"option token missing for {symbol}"
+    try:
+        fresh_token = _tokfix_fresh_token_for_symbol(symbol, exchange)
+    except Exception:
+        fresh_token = ""
+    if not fresh_token:
+        return f"fresh option token unavailable for {symbol}"
+    if str(fresh_token) != str(token):
+        return f"option token stale for {symbol}: {token}->{fresh_token}"
+    return ""
+
+
+def _live_safety_option_ltp_block_reason(option, premium=None):
+    option = option or {}
+    try:
+        fresh_ltp = _okai_fresh_option_ltp(option, "live_safety_entry", max_age_seconds=0)
+        if fresh_ltp <= 0:
+            return f"option LTP missing for {option.get('symbol', '')}"
+        option["premium"] = fresh_ltp
+        option["live_safety_ltp"] = fresh_ltp
+        option["live_safety_ltp_ts"] = _live_safety_now_ts()
+        safe_runtime["live_safety_last_option_ltp"] = {
+            "symbol": option.get("symbol", ""),
+            "ltp": fresh_ltp,
+            "ts": option["live_safety_ltp_ts"],
+        }
+    except Exception as exc:
+        return f"option LTP unavailable: {str(exc)[:80]}"
+    return ""
+
+
+def _live_safety_data_block_reason(signal="", option=None, premium=None):
+    checks = (
+        _live_safety_websocket_block_reason,
+        _live_safety_candle_block_reason,
+        _live_safety_index_ltp_block_reason,
+        lambda: _live_safety_option_token_block_reason(option),
+        lambda: _live_safety_option_ltp_block_reason(option, premium),
+    )
+    for check in checks:
+        reason = check()
+        if reason:
+            return reason
+    return ""
+
+
+def apply_live_strategy_runtime_settings():
+    _OKAI_LIVE_SAFETY_BASE_APPLY_RUNTIME()
+    changed = False
+    forced = {
+        "weighted_min_entry_score": LIVE_SAFETY_MIN_WEIGHTED_SCORE,
+        "safe_max_trades_per_day": LIVE_SAFETY_MAX_TRADES_PER_DAY,
+        "max_trades_per_day": LIVE_SAFETY_MAX_TRADES_PER_DAY,
+        "safe_max_consecutive_losses": LIVE_SAFETY_MAX_LOSSES_PER_DAY,
+        "max_consecutive_losses": LIVE_SAFETY_MAX_LOSSES_PER_DAY,
+        "safe_loss_cooldown_minutes": 15,
+        "expiry_max_capital_use_percent": LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT,
+        "expiry_after_loss_qty_percent": LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT,
+        "expiry_full_capital_enabled": False,
+    }
+    for key, value in forced.items():
+        if config.get(key) != value:
+            config[key] = value
+            changed = True
+    if changed:
+        try:
+            save_cloud_config()
+        except Exception as exc:
+            gui_log(f"LIVE safety config save skipped: {exc}")
+    return None
+
+
+def enforce_weighted_execution_rules(setup, decision, source="gemini"):
+    decision = _OKAI_LIVE_SAFETY_BASE_ENFORCE_WEIGHTED(setup, decision, source)
+    if _live_safety_is_live_entry() and bool((decision or {}).get("take_trade")):
+        score = _live_safety_int((setup or {}).get("score"), 0)
+        if score < LIVE_SAFETY_MIN_WEIGHTED_SCORE:
+            reason = f"LIVE weighted floor block: score {score}<82"
+            decision["take_trade"] = False
+            decision["signal"] = "WAIT"
+            decision["entry_type"] = "NONE"
+            decision["trade_type"] = "NONE"
+            decision["reason"] = reason
+            gui_log(f"LIVE SAFETY BLOCK | weighted approval | {reason}")
+    return decision
+
+
+def _okai_build_trade_quality(signal, premium=None, option=None, df=None, price=None, require_premium=True, backtest=False):
+    approved, quality = _OKAI_LIVE_SAFETY_BASE_BUILD_TRADE_QUALITY(
+        signal, premium, option, df, price, require_premium, backtest
+    )
+    if backtest or not _live_safety_is_live_entry() or not isinstance(quality, dict):
+        return approved, quality
+    score = _live_safety_int(quality.get("score"), 0)
+    if approved and score < LIVE_SAFETY_MIN_WEIGHTED_SCORE:
+        reason = f"LIVE bridge/override score {score}<82"
+        blocks = list(quality.get("blocks") or [])
+        if reason not in blocks:
+            blocks.insert(0, reason)
+        quality["blocks"] = blocks
+        quality["approved"] = False
+        quality["live_safety_block"] = reason
+        gui_log(f"LIVE SAFETY BLOCK | bridge/override | {reason}")
+        return False, quality
+    return approved, quality
+
+
+def safety_trade_limits_block_reason():
+    reason = _OKAI_LIVE_SAFETY_BASE_TRADE_LIMITS()
+    if reason:
+        return reason
+    if _live_safety_is_live_entry():
+        reason = _live_safety_trade_limit_block_reason()
+        if reason:
+            gui_log(f"LIVE SAFETY BLOCK | trade limit | {reason}")
+            return reason
+    return ""
+
+
+def expiry_capital_use_percent():
+    try:
+        base = float(_OKAI_LIVE_SAFETY_BASE_EXPIRY_CAPITAL_USE_PERCENT())
+    except Exception:
+        base = LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT
+    return min(base, LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT)
+
+
+def expiry_after_loss_qty_percent():
+    try:
+        base = float(_OKAI_LIVE_SAFETY_BASE_EXPIRY_AFTER_LOSS_QTY_PERCENT())
+    except Exception:
+        base = LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT
+    return min(base, LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT)
+
+
+def place_paper_trade(signal, premium, trade_type="FULL", option=None):
+    if _live_safety_is_live_entry():
+        score_reason = _live_safety_score_block_reason(signal)
+        if score_reason:
+            _live_safety_log_block(score_reason, signal, trade_type, option)
+            return None
+
+        limit_reason = _live_safety_trade_limit_block_reason()
+        if limit_reason:
+            _live_safety_log_block(limit_reason, signal, trade_type, option)
+            return None
+
+        data_reason = _live_safety_data_block_reason(signal, option, premium)
+        if data_reason:
+            _live_safety_log_block(data_reason, signal, trade_type, option)
+            return None
+
+        if isinstance(option, dict) and _live_safety_float(option.get("live_safety_ltp"), 0.0) > 0:
+            premium = option["live_safety_ltp"]
+
+    return _OKAI_LIVE_SAFETY_BASE_PLACE_PAPER_TRADE(signal, premium, trade_type, option)
+
+
+def place_live_order(option, transaction_type, qty, reason=""):
+    tx = str(transaction_type or "").upper()
+    if tx == "BUY" and _live_safety_is_live_entry():
+        data_reason = _live_safety_data_block_reason("", option, (option or {}).get("premium"))
+        if data_reason:
+            _live_safety_log_block(data_reason, "LIVE", "BUY", option)
+            raise RuntimeError(f"LIVE safety blocked BUY: {data_reason}")
+    return _OKAI_LIVE_SAFETY_BASE_PLACE_LIVE_ORDER(option, transaction_type, qty, reason)
+
+
+def _open_position_after_entry(signal, premium, trade_type, option, qty, mode, live_order_id="", live_order_response=None):
+    pos = _OKAI_LIVE_SAFETY_BASE_OPEN_POSITION(
+        signal, premium, trade_type, option, qty, mode, live_order_id, live_order_response
+    )
+    try:
+        if pos and str(mode or pos.get("mode", "") or "").upper() == "LIVE":
+            _live_safety_reset_runtime_day()
+            current_entries = _live_safety_int(safe_runtime.get("live_safety_entry_count"), 0)
+            safe_runtime["live_safety_entry_count"] = max(
+                current_entries + 1,
+                _live_safety_today_trade_count(),
+            )
+            gui_log(
+                "LIVE SAFETY ENTRY COUNT | "
+                f"{safe_runtime['live_safety_entry_count']}/{LIVE_SAFETY_MAX_TRADES_PER_DAY}"
+            )
+    except Exception as exc:
+        gui_log(f"LIVE safety entry count update skipped: {str(exc)[:120]}")
+    return pos
+
+
+def close_position(exit_price, reason):
+    snapshot = dict(position or {})
+    result = _OKAI_LIVE_SAFETY_BASE_CLOSE_POSITION(exit_price, reason)
+    try:
+        if str(snapshot.get("mode", "") or "").upper() == "LIVE" and _live_safety_float(result, 0.0) < 0:
+            _live_safety_reset_runtime_day()
+            now = _live_safety_now_ts()
+            safe_runtime["live_safety_last_loss_ts"] = now
+            safe_runtime["live_safety_loss_cooldown_until"] = now + LIVE_SAFETY_LOSS_COOLDOWN_SECONDS
+            safe_runtime["live_safety_loss_count"] = max(
+                _live_safety_today_loss_count(),
+                _live_safety_int(safe_runtime.get("live_safety_loss_count"), 0) + 1,
+            )
+            gui_log(
+                "LIVE SAFETY LOSS COOLDOWN | "
+                f"15m wait after loss | losses {safe_runtime['live_safety_loss_count']}/{LIVE_SAFETY_MAX_LOSSES_PER_DAY}"
+            )
+            if _live_safety_today_loss_count() >= LIVE_SAFETY_MAX_LOSSES_PER_DAY:
+                safe_runtime["daily_stop_reason"] = (
+                    f"LIVE safety: stopped after {_live_safety_today_loss_count()} LIVE losses today"
+                )
+                gui_log(f"LIVE SAFETY DAY STOP | {safe_runtime['daily_stop_reason']}")
+    except Exception as exc:
+        gui_log(f"LIVE safety loss tracking skipped: {str(exc)[:120]}")
+    return result
+
+
+def status_payload():
+    payload = _OKAI_LIVE_SAFETY_BASE_STATUS_PAYLOAD()
+    try:
+        if isinstance(payload.get("trade_limits"), dict):
+            payload["trade_limits"]["max_trades_per_day"] = LIVE_SAFETY_MAX_TRADES_PER_DAY
+            payload["trade_limits"]["max_live_losses_per_day"] = LIVE_SAFETY_MAX_LOSSES_PER_DAY
+            payload["trade_limits"]["loss_cooldown_minutes"] = 15
+            payload["trade_limits"]["cooldown_seconds_left"] = max(
+                payload["trade_limits"].get("cooldown_seconds_left", 0),
+                int(max(0, _live_safety_float(safe_runtime.get("live_safety_loss_cooldown_until"), 0.0) - _live_safety_now_ts())),
+            )
+        payload["live_safety"] = {
+            "enabled": True,
+            "min_weighted_score": LIVE_SAFETY_MIN_WEIGHTED_SCORE,
+            "max_live_trades_per_day": LIVE_SAFETY_MAX_TRADES_PER_DAY,
+            "max_live_losses_per_day": LIVE_SAFETY_MAX_LOSSES_PER_DAY,
+            "loss_cooldown_minutes": 15,
+            "expiry_capital_cap_percent": LIVE_SAFETY_EXPIRY_CAPITAL_USE_PERCENT,
+            "trades_today": _live_safety_today_trade_count(),
+            "losses_today": _live_safety_today_loss_count(),
+            "last_block": safe_runtime.get("live_safety_last_block", ""),
+        }
+        payload["server_version"] = SERVER_VERSION
+    except Exception:
+        pass
+    return payload
+
+
+def build_risk_text():
+    text = _OKAI_LIVE_SAFETY_BASE_BUILD_RISK_TEXT()
+    return text + (
+        "\n\nLIVE Safety Hard Blocks v29:\n"
+        "LIVE entries require weighted score >=82 after all bridge/override logic. "
+        "Max LIVE trades/day 5. Stop after 3 LIVE losses. "
+        "After any LIVE loss, wait 15 minutes. "
+        "Entry blocks if index LTP, option LTP, candle data, websocket, or option token is stale/missing. "
+        "Expiry-day capital use capped at 50%."
+    )
+
+
+# ===== END PATCH: LIVE SAFETY HARD BLOCKS =====
+
+
 if __name__ == "__main__":
     main()
