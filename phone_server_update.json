@@ -1,9 +1,9 @@
 {
-    "version":  "2026.06.19-trade-quality-upgrade",
-    "server_version":  "2026.06.19-trade-quality-upgrade",
+    "version":  "2026.06.22-adx-soft-30",
+    "server_version":  "2026.06.22-adx-soft-30",
     "file":  "app.py",
-    "sha256":  "1f131c94b4bafc1d2c603a0cec1b76b5d17f5afbdf866ddf78b7e26269c32dad",
-    "size":  880982,
-    "updated_at":  "2026-06-19T14:19:17Z",
-    "notes":  "Sync update metadata with latest GitHub main app.py after trade quality upgrade."
+    "sha256":  "42b70338e88ebb53567b820919f7d51c9bc348c6000de20fb3ea808ca28edf72",
+    "size":  926066,
+    "updated_at":  "2026-06-22T18:24:08Z",
+    "notes":  "ADX soft gate: low ADX now applies score penalty instead of standalone hard block; final weighted 82 and live safety gates still decide."
 }

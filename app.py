@@ -22027,5 +22027,68 @@ def build_risk_text():
 # ===== END PATCH: LIVE SAFETY HARD BLOCKS =====
 
 
+# ===== OPTION KING AI PATCH: ADX SOFT GATE =====
+# Version: 2026.06.22-adx-soft-30
+#
+# ADX should not be the only reason a clean LIVE setup is missed.
+# Low ADX now applies a score penalty and lets the final weighted >=82,
+# sideways, volume, MTF, premium, token, and LIVE safety gates decide.
+
+SERVER_VERSION = "2026.06.22-adx-soft-30"
+
+_OKAI_ADX_SOFT_BASE_BUILD_RISK_TEXT = build_risk_text
+_OKAI_ADX_SOFT_BASE_BUILD_SETTINGS_TEXT = build_settings_text
+
+
+def _tqu_adx_low_penalty():
+    try:
+        return int(_okai_config_float("tqu_adx_low_penalty", -12, -30, 0))
+    except Exception:
+        return -12
+
+
+def _tqu_adx_check(setup):
+    """
+    Returns (pass: bool, score_penalty: int, reason: str).
+    ADX < tqu_adx_min_trade is no longer a hard block.
+    It gets a stronger score penalty, then final LIVE safety still requires 82+.
+    """
+    adx = float(setup.get("adx14", setup.get("adx", 0)) or 0)
+    min_trade = _tqu_adx_min_trade()
+    weak_thr = _tqu_adx_weak_threshold()
+
+    if adx < min_trade:
+        penalty = _tqu_adx_low_penalty()
+        return True, penalty, (
+            f"ADX {adx:.1f} < {min_trade:.0f}: low trend penalty {penalty}; "
+            "no hard ADX block, final 82+ gate decides"
+        )
+    if adx < weak_thr:
+        return True, -8, f"ADX {adx:.1f} weak trend ({min_trade:.0f}-{weak_thr:.0f}): -8 score"
+    return True, 0, f"ADX {adx:.1f} strong trend (>{weak_thr:.0f}): OK"
+
+
+def build_risk_text():
+    text = _OKAI_ADX_SOFT_BASE_BUILD_RISK_TEXT()
+    return text + (
+        "\n\nADX Soft Gate v30:\n"
+        "ADX below 18 is no longer a standalone hard block. "
+        "It applies a stronger score penalty, and the final weighted >=82, sideways, volume, MTF, "
+        "premium, token, and LIVE safety gates still decide whether an entry can execute."
+    )
+
+
+def build_settings_text():
+    text = _OKAI_ADX_SOFT_BASE_BUILD_SETTINGS_TEXT()
+    return text + (
+        "\n\nADX Soft Gate:\n"
+        f"ADX < {_tqu_adx_min_trade():.0f} penalty {_tqu_adx_low_penalty()} points; "
+        "no standalone hard ADX block."
+    )
+
+
+# ===== END PATCH: ADX SOFT GATE =====
+
+
 if __name__ == "__main__":
     main()
