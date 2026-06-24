@@ -1,9 +1,9 @@
 {
-    "version":  "2026.06.22-adx-soft-30",
-    "server_version":  "2026.06.22-adx-soft-30",
+    "version":  "2026.06.24-bugfix-hybrid-exit-31",
+    "server_version":  "2026.06.24-bugfix-hybrid-exit-31",
     "file":  "app.py",
-    "sha256":  "42b70338e88ebb53567b820919f7d51c9bc348c6000de20fb3ea808ca28edf72",
-    "size":  926066,
-    "updated_at":  "2026-06-22T18:24:08Z",
-    "notes":  "ADX soft gate: low ADX now applies score penalty instead of standalone hard block; final weighted 82 and live safety gates still decide."
+    "sha256":  "37b7b452110159599469e00a71059dfb6c876ee42f406d9bd3562b77957f9220",
+    "size":  972632,
+    "updated_at":  "2026-06-24T14:20:31Z",
+    "notes":  "Bugfix + hybrid exit engine: safe backtest rate-limit handling, neutral missing ADX, Paper/Live route fix, risk cap, target sync, chart/status score breakdown, and dynamic trailing exit payload."
 }
