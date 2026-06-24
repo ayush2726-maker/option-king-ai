@@ -23217,5 +23217,57 @@ Handler.do_POST = _okai_fix_handler_do_post
 # ===== END PATCH: BUGFIX + HYBRID EXIT ENGINE =====
 
 
+# ===== OPTION KING AI PATCH: FINAL API PAYLOAD ALIGNMENT =====
+# Version: 2026.06.24-api-payload-align-32
+
+SERVER_VERSION = "2026.06.24-api-payload-align-32"
+
+_OKAI_API_ALIGN_BASE_HEALTH_PAYLOAD = health_payload
+_OKAI_API_ALIGN_BASE_HANDLER_DO_GET = Handler.do_GET
+
+
+def health_payload(test_angel=False):
+    payload = _OKAI_API_ALIGN_BASE_HEALTH_PAYLOAD(test_angel=test_angel)
+    try:
+        payload["server_version"] = SERVER_VERSION
+        payload["trade_mode"] = trade_mode()
+        payload["mode"] = trade_mode()
+        payload["live_trading_enabled"] = live_trading_enabled()
+        payload["live_safety_enabled"] = _okai_fix_live_safety_enabled()
+        payload["paper_disabled"] = False
+        payload["safe_live_mode"] = {
+            "trade_mode": trade_mode(),
+            "live_trading_enabled": live_trading_enabled(),
+            "paper_mode_allowed": True,
+            "live_buy_requires_safety": True,
+        }
+        payload["capital_debug"] = _okai_fix_capital_debug_payload()
+        payload["exit_engine"] = _okai_fix_exit_engine_payload()
+        payload["strategy_score_breakdown"] = _okai_fix_strategy_score_breakdown()
+    except Exception as exc:
+        payload["api_align_error"] = str(exc)[:160]
+    return json_safe(payload)
+
+
+def _okai_api_align_handler_do_get(self):
+    if not self.authorized():
+        self.send_json({"ok": False, "error": "unauthorized"}, 401)
+        return
+    path = urlparse(self.path).path
+    if path == "/status":
+        self.send_json({"ok": True, "data": status_payload()})
+        return
+    if path == "/health":
+        self.send_json({"ok": True, "title": "Health", "data": health_payload(), "text": build_health_text()})
+        return
+    return _OKAI_API_ALIGN_BASE_HANDLER_DO_GET(self)
+
+
+Handler.do_GET = _okai_api_align_handler_do_get
+
+
+# ===== END PATCH: FINAL API PAYLOAD ALIGNMENT =====
+
+
 if __name__ == "__main__":
     main()

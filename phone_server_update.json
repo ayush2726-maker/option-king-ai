@@ -1,9 +1,9 @@
 {
-    "version":  "2026.06.24-bugfix-hybrid-exit-31",
-    "server_version":  "2026.06.24-bugfix-hybrid-exit-31",
+    "version":  "2026.06.24-api-payload-align-32",
+    "server_version":  "2026.06.24-api-payload-align-32",
     "file":  "app.py",
-    "sha256":  "37b7b452110159599469e00a71059dfb6c876ee42f406d9bd3562b77957f9220",
-    "size":  972632,
-    "updated_at":  "2026-06-24T14:20:31Z",
-    "notes":  "Bugfix + hybrid exit engine: safe backtest rate-limit handling, neutral missing ADX, Paper/Live route fix, risk cap, target sync, chart/status score breakdown, and dynamic trailing exit payload."
+    "sha256":  "6b31c92014d4cd11f39cc6e04ed1e8003285901b30999d3dfc866f90c1cc1b7b",
+    "size":  974506,
+    "updated_at":  "2026-06-24T14:28:13Z",
+    "notes":  "Bugfix + hybrid exit engine plus final API alignment: /status and /health now expose mode, live safety, capital debug, exit engine, chart, and strategy score breakdown from the final patched payload."
 }
