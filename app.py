@@ -22090,5 +22090,1132 @@ def build_settings_text():
 # ===== END PATCH: ADX SOFT GATE =====
 
 
+# ===== OPTION KING AI PATCH: BUGFIX + HYBRID EXIT ENGINE =====
+# Version: 2026.06.24-bugfix-hybrid-exit-31
+
+SERVER_VERSION = "2026.06.24-bugfix-hybrid-exit-31"
+
+_OKAI_FIX_BASE_APPLY_RUNTIME = apply_live_strategy_runtime_settings
+_OKAI_FIX_BASE_SET_TRADE_MODE = set_trade_mode
+_OKAI_FIX_BASE_PLACE_PAPER_TRADE = place_paper_trade
+_OKAI_FIX_BASE_PLACE_LIVE_ORDER = place_live_order
+_OKAI_FIX_BASE_OPEN_POSITION = _open_position_after_entry
+_OKAI_FIX_BASE_CLOSE_POSITION = close_position
+_OKAI_FIX_BASE_MANAGE_TRADE = manage_paper_trade
+_OKAI_FIX_BASE_UPDATE_TRAILING_SL = update_trailing_sl
+_OKAI_FIX_BASE_GET_QTY = get_qty
+_OKAI_FIX_BASE_BACKTEST_RISK_CAP_QTY = backtest_risk_cap_qty
+_OKAI_FIX_BASE_FETCH_BACKTEST_CANDLES = fetch_backtest_candles
+_OKAI_FIX_BASE_RUN_BACKTEST_DAY = run_mobile_backtest_day
+_OKAI_FIX_BASE_RUN_MONTHLY_BACKTEST = run_mobile_monthly_backtest
+_OKAI_FIX_BASE_RUN_BACKTEST = run_mobile_backtest
+_OKAI_FIX_BASE_RUN_BACKTEST_WORKER = run_mobile_backtest_worker
+_OKAI_FIX_BASE_BUILD_MONTHLY_REPORT = build_monthly_backtest_report
+_OKAI_FIX_BASE_STATUS_PAYLOAD = status_payload
+_OKAI_FIX_BASE_CHART_PAYLOAD = chart_payload
+_OKAI_FIX_BASE_STATUS_CHART_PAYLOAD = status_chart_payload
+_OKAI_FIX_BASE_GET_POSITION_PAYLOAD = get_position_payload
+_OKAI_FIX_BASE_BUILD_LIVE_TEXT = build_live_text
+_OKAI_FIX_BASE_BUILD_RISK_TEXT = build_risk_text
+_OKAI_FIX_BASE_BUILD_SETTINGS_TEXT = build_settings_text
+_OKAI_FIX_BASE_TQU_ADX_CHECK = _tqu_adx_check
+_OKAI_FIX_BASE_WEIGHTED_ADX14 = weighted_adx14_snapshot
+_OKAI_FIX_BASE_HANDLER_DO_GET = Handler.do_GET
+_OKAI_FIX_BASE_HANDLER_DO_POST = Handler.do_POST
+
+_OKAI_FIX_CANDLE_CACHE = {}
+_OKAI_FIX_OPTION_CANDLE_CACHE = {}
+_OKAI_FIX_LAST_BACKTEST_DETAILS = {}
+
+
+def _okai_fix_float(value, default=0.0):
+    try:
+        if value is None:
+            return None if default is None else float(default)
+        if "pd" in globals() and pd.isna(value):
+            return None if default is None else float(default)
+        return float(value)
+    except Exception:
+        return None if default is None else float(default)
+
+
+def _okai_fix_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _okai_fix_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "live", "enabled"}
+
+
+def _okai_fix_log(message):
+    try:
+        gui_log(message)
+    except Exception:
+        pass
+
+
+def _okai_fix_is_rate_limit_error(exc):
+    text = str(exc or "").lower()
+    return any(token in text for token in [
+        "rate", "access denied", "exceeding access rate", "too many", "429", "json", "decode"
+    ])
+
+
+def _okai_fix_cache_copy(df):
+    try:
+        return df.copy()
+    except Exception:
+        return df
+
+
+def _okai_fix_compute_adx_from_ohlc(df, period=14):
+    if df is None or len(df) < period + 2:
+        return None
+    try:
+        work = df.copy()
+        for col in ["high", "low", "close"]:
+            if col not in work.columns:
+                return None
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+        work = work.dropna(subset=["high", "low", "close"])
+        if len(work) < period + 2:
+            return None
+        high = work["high"]
+        low = work["low"]
+        close = work["close"]
+        prev_close = close.shift(1)
+        up_move = high.diff()
+        down_move = low.shift(1) - low
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=work.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=work.index)
+        tr = pd.concat([
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1).replace([np.inf, -np.inf], np.nan)
+        tr = tr.fillna(0).clip(lower=0.0001)
+        alpha = 1.0 / float(period)
+        tr_smooth = tr.ewm(alpha=alpha, adjust=False).mean().clip(lower=0.0001)
+        plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / tr_smooth
+        minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / tr_smooth
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx_series = dx.ewm(alpha=alpha, adjust=False).mean()
+        adx_value = _okai_fix_float(adx_series.dropna().iloc[-1] if not adx_series.dropna().empty else None, None)
+        if adx_value is None or adx_value <= 0:
+            return None
+        return {
+            "ready": True,
+            "adx14": adx_value,
+            "plus_di": _okai_fix_float(plus_di.dropna().iloc[-1] if not plus_di.dropna().empty else 0),
+            "minus_di": _okai_fix_float(minus_di.dropna().iloc[-1] if not minus_di.dropna().empty else 0),
+            "adx_score": 12 if adx_value >= 30 else 8 if adx_value >= 25 else 4 if adx_value >= 20 else 0,
+            "reason": f"ADX14 {adx_value:.2f} from NIFTY 1m OHLC",
+            "source": "NIFTY_1M_HLC",
+        }
+    except Exception as exc:
+        _okai_fix_log(f"ADX DATA MISSING | compute failed | {str(exc)[:120]}")
+        return None
+
+
+def weighted_adx14_snapshot(work, period=14):
+    snapshot = _okai_fix_compute_adx_from_ohlc(work, period)
+    if snapshot:
+        _okai_fix_log(
+            f"ADX DEBUG | source=NIFTY_1M_HLC | adx={snapshot['adx14']:.2f} | "
+            f"+DI={snapshot.get('plus_di', 0):.2f} | -DI={snapshot.get('minus_di', 0):.2f}"
+        )
+        return snapshot
+    _okai_fix_log("ADX DATA MISSING | NIFTY 1m high/low/close unavailable | neutral")
+    return {
+        "ready": False,
+        "adx14": None,
+        "plus_di": None,
+        "minus_di": None,
+        "adx_score": 0,
+        "reason": "ADX missing from NIFTY 1m OHLC; neutral, no hard block",
+        "source": "NIFTY_1M_HLC",
+    }
+
+
+def _tqu_adx_check(setup):
+    raw = None
+    if isinstance(setup, dict):
+        raw = setup.get("adx14", setup.get("adx"))
+        if raw in ("", 0, 0.0, "0", "0.0"):
+            raw = None
+        if raw is None and isinstance(setup.get("snapshot"), dict):
+            raw = setup["snapshot"].get("adx14")
+    adx = _okai_fix_float(raw, None)
+    if adx is None or adx <= 0:
+        _okai_fix_log("ADX DATA MISSING | setup ADX unavailable/zero | neutral; trade not blocked")
+        return True, 0, "ADX missing/neutral; no hard ADX block"
+    min_trade = _tqu_adx_min_trade()
+    weak_thr = _tqu_adx_weak_threshold()
+    if adx < min_trade:
+        penalty = _tqu_adx_low_penalty()
+        return True, penalty, (
+            f"ADX {adx:.1f} < {min_trade:.0f}: low trend penalty {penalty}; "
+            "no hard ADX block, final 82+ gate decides"
+        )
+    if adx < weak_thr:
+        return True, -8, f"ADX {adx:.1f} weak trend ({min_trade:.0f}-{weak_thr:.0f}): -8 score"
+    return True, 0, f"ADX {adx:.1f} strong trend (>{weak_thr:.0f}): OK"
+
+
+def fetch_backtest_candles(day):
+    key = day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
+    cached = _OKAI_FIX_CANDLE_CACHE.get(key)
+    if cached is not None:
+        return _okai_fix_cache_copy(cached)
+    last_exc = None
+    for attempt in range(3):
+        try:
+            df = _OKAI_FIX_BASE_FETCH_BACKTEST_CANDLES(day)
+            if df is None or df.empty:
+                raise RuntimeError("empty candle response")
+            adx_snapshot = _okai_fix_compute_adx_from_ohlc(df)
+            if adx_snapshot:
+                try:
+                    df["ADX14"] = _okai_fix_float(adx_snapshot.get("adx14"), 0)
+                except Exception:
+                    pass
+            _OKAI_FIX_CANDLE_CACHE[key] = _okai_fix_cache_copy(df)
+            return df
+        except Exception as exc:
+            last_exc = exc
+            if _okai_fix_is_rate_limit_error(exc):
+                _okai_fix_log(
+                    f"BACKTEST RATE LIMIT | day={key} | attempt={attempt + 1}/3 | "
+                    f"safe retry/backoff | {str(exc)[:120]}"
+                )
+                time.sleep(min(1.5 * (attempt + 1), 4.0))
+                continue
+            _okai_fix_log(f"BACKTEST CANDLE ERROR | day={key} | {str(exc)[:160]}")
+            break
+    cached = _OKAI_FIX_CANDLE_CACHE.get(key)
+    if cached is not None:
+        _okai_fix_log(f"BACKTEST CACHE FALLBACK | day={key} | using previous cached candles")
+        return _okai_fix_cache_copy(cached)
+    raise RuntimeError(f"Backtest candles unavailable for {key}: {str(last_exc)[:180]}")
+
+
+def _okai_fix_day_stats(result):
+    trades = list((result or {}).get("trades") or [])
+    start = _okai_fix_float((result or {}).get("start_capital"), 0)
+    final = _okai_fix_float((result or {}).get("final_capital"), start)
+    running = start
+    peak = start
+    max_dd = 0.0
+    wins = 0
+    losses = 0
+    for trade in trades:
+        pnl = _okai_fix_float(trade.get("pnl", trade.get("net_pnl", 0)), 0)
+        running += pnl
+        peak = max(peak, running)
+        max_dd = min(max_dd, running - peak)
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+    return {
+        "day": (result or {}).get("day"),
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "pnl": final - start,
+        "start_capital": start,
+        "final_capital": final,
+        "drawdown": max_dd,
+        "stop_reason": (result or {}).get("stop_reason", ""),
+    }
+
+
+def _okai_fix_day_table(day_results):
+    rows = []
+    for result in day_results or []:
+        stats = result.get("day_stats") or _okai_fix_day_stats(result)
+        day = stats.get("day")
+        day_text = day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day or "--")
+        rows.append(
+            f"{day_text} | Trades {stats['trades']} | W/L {stats['wins']}/{stats['losses']} | "
+            f"P&L {stats['pnl']:.2f} | DD {stats['drawdown']:.2f} | Final {stats['final_capital']:.2f}"
+        )
+    return rows
+
+
+def run_mobile_backtest_day(mode, day, start_capital):
+    result = _OKAI_FIX_BASE_RUN_BACKTEST_DAY(mode, day, start_capital)
+    try:
+        result["day_stats"] = _okai_fix_day_stats(result)
+        if "DAY-WISE RESULT" not in str(result.get("report", "")):
+            result["report"] = (
+                str(result.get("report", "")) +
+                "\n\nDAY-WISE RESULT\n" +
+                "\n".join(_okai_fix_day_table([result]))
+            ).strip()
+    except Exception as exc:
+        _okai_fix_log(f"Backtest day stats skipped: {str(exc)[:120]}")
+    return result
+
+
+def build_monthly_backtest_report(mode, start_day, end_day, start_capital, final_capital, day_results, skipped):
+    summary, report = _OKAI_FIX_BASE_BUILD_MONTHLY_REPORT(
+        mode, start_day, end_day, start_capital, final_capital, day_results, skipped
+    )
+    try:
+        table = _okai_fix_day_table(day_results)
+        if table and "DAY-WISE RESULT TABLE" not in report:
+            report += "\n\nDAY-WISE RESULT TABLE\n" + "\n".join(table)
+    except Exception as exc:
+        report += f"\n\nDay-wise table unavailable: {exc}"
+    return summary, report
+
+
+def run_mobile_monthly_backtest(payload, mode, start_capital):
+    start_day, end_day = parse_backtest_month((payload or {}).get("month") or (payload or {}).get("date"))
+    running_capital = start_capital
+    day_results = []
+    skipped = []
+    for day in backtest_market_days(start_day, end_day):
+        try:
+            result = run_mobile_backtest_day(mode, day, running_capital)
+            running_capital = _okai_fix_float(result.get("final_capital"), running_capital)
+            day_results.append(result)
+        except Exception as exc:
+            skipped.append((day, str(exc)[:180]))
+    if not day_results and skipped:
+        raise RuntimeError("Monthly backtest skipped all days: " + skipped[-1][1])
+    summary, report = build_monthly_backtest_report(
+        mode, start_day, end_day, start_capital, running_capital, day_results, skipped
+    )
+    _OKAI_FIX_LAST_BACKTEST_DETAILS.clear()
+    _OKAI_FIX_LAST_BACKTEST_DETAILS.update({
+        "mode": mode,
+        "start_day": start_day.strftime("%Y-%m-%d"),
+        "end_day": end_day.strftime("%Y-%m-%d"),
+        "day_results": [json_safe({"day_stats": r.get("day_stats"), "summary": r.get("summary")}) for r in day_results],
+        "skipped": [(d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d), reason) for d, reason in skipped],
+    })
+    return summary, report
+
+
+def run_mobile_backtest(payload=None):
+    payload = payload or {}
+    mode = str(payload.get("mode", "FAST") or "FAST").upper()
+    start_capital = _okai_fix_float(payload.get("capital") or paper_capital or capital, 50000)
+    if mode in {"MONTH", "MONTHLY"}:
+        return run_mobile_monthly_backtest(payload, "MONTHLY", start_capital)
+    day = parse_backtest_day(payload.get("date"))
+    result = run_mobile_backtest_day(mode, day, start_capital)
+    _OKAI_FIX_LAST_BACKTEST_DETAILS.clear()
+    _OKAI_FIX_LAST_BACKTEST_DETAILS.update(json_safe({
+        "mode": mode,
+        "start_day": day.strftime("%Y-%m-%d"),
+        "end_day": day.strftime("%Y-%m-%d"),
+        "day_results": [{"day_stats": result.get("day_stats"), "summary": result.get("summary")}],
+        "skipped": [],
+    }))
+    return result["summary"], result["report"]
+
+
+def run_mobile_backtest_worker(payload=None):
+    global last_backtest_report, last_backtest_summary, backtest_running
+    try:
+        summary, report = run_mobile_backtest(payload)
+        last_backtest_summary = summary
+        last_backtest_report = report
+        _okai_fix_log(f"Backtest done | {summary}")
+        send_msg(f"Backtest done\n{summary}")
+    except Exception as exc:
+        last_backtest_summary = "Backtest error"
+        last_backtest_report = f"Backtest error: {exc}"
+        _OKAI_FIX_LAST_BACKTEST_DETAILS.clear()
+        _OKAI_FIX_LAST_BACKTEST_DETAILS.update({"error": str(exc)})
+        _okai_fix_log(f"Backtest error: {exc}")
+        send_msg(f"Backtest error: {exc}")
+    finally:
+        with backtest_lock:
+            backtest_running = False
+
+
+def apply_live_strategy_runtime_settings():
+    try:
+        _OKAI_FIX_BASE_APPLY_RUNTIME()
+    except Exception as exc:
+        _okai_fix_log(f"Runtime base settings skipped: {str(exc)[:120]}")
+    changed = False
+    desired_defaults = {
+        "trade_mode": "PAPER",
+        "mode": "PAPER",
+        "live_trading_enabled": False,
+        "live_safety_enabled": True,
+        "paper_disabled": False,
+        "weighted_min_entry_score": 82,
+        "max_risk_per_trade_percent": 1.0,
+    }
+    for key, value in desired_defaults.items():
+        if key not in config:
+            config[key] = value
+            changed = True
+    current_mode = str(config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER").upper()
+    if current_mode not in {"PAPER", "LIVE"}:
+        current_mode = "PAPER"
+        changed = True
+    config["trade_mode"] = current_mode
+    config["mode"] = current_mode
+    if current_mode == "PAPER":
+        config["live_trading_enabled"] = False
+        config["paper_disabled"] = False
+    try:
+        globals()["LIVE_TRADING"] = bool(current_mode == "LIVE" and config.get("live_trading_enabled"))
+    except Exception:
+        pass
+    if changed:
+        save_cloud_config()
+    _okai_fix_log(
+        f"MODE SWITCH | runtime preserve | mode={config.get('trade_mode')} | "
+        f"live_enabled={bool(config.get('live_trading_enabled'))}"
+    )
+
+
+def _okai_force_live_only(reason="", persist=True):
+    # Older patch used this hook to force LIVE. Final behavior preserves user mode.
+    return trade_mode() == "LIVE"
+
+
+def trade_mode():
+    mode = str(config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER").upper()
+    return "LIVE" if mode == "LIVE" else "PAPER"
+
+
+def is_live_mode():
+    return trade_mode() == "LIVE"
+
+
+def live_trading_enabled():
+    return bool(is_live_mode() and _okai_fix_bool(config.get("live_trading_enabled"), False))
+
+
+def _okai_fix_live_safety_enabled():
+    return _okai_fix_bool(config.get("live_safety_enabled", True), True)
+
+
+def set_trade_mode(mode=None, live_enabled=None):
+    mode_text = str(mode or config.get("trade_mode", "PAPER") or "PAPER").strip().upper()
+    if mode_text not in {"PAPER", "LIVE"}:
+        raise ValueError("mode must be PAPER or LIVE")
+    if mode_text == "PAPER":
+        config["trade_mode"] = "PAPER"
+        config["mode"] = "PAPER"
+        config["live_trading_enabled"] = False
+        config["safe_live_manual_session_confirmed"] = False
+        config["paper_disabled"] = False
+        enabled = False
+    else:
+        enabled = _okai_fix_bool(live_enabled, True)
+        if not _okai_fix_live_safety_enabled():
+            enabled = False
+        config["trade_mode"] = "LIVE"
+        config["mode"] = "LIVE"
+        config["live_trading_enabled"] = bool(enabled)
+        config["safe_live_manual_session_confirmed"] = bool(enabled)
+        config["paper_disabled"] = False
+    try:
+        globals()["LIVE_TRADING"] = bool(config.get("trade_mode") == "LIVE" and config.get("live_trading_enabled"))
+    except Exception:
+        pass
+    save_cloud_config()
+    _okai_fix_log(
+        f"MODE SWITCH | mode={config.get('trade_mode')} | live_enabled={bool(config.get('live_trading_enabled'))} | "
+        f"live_safety={_okai_fix_live_safety_enabled()}"
+    )
+    return {
+        "trade_mode": config.get("trade_mode"),
+        "mode": config.get("mode"),
+        "live_trading_enabled": bool(config.get("live_trading_enabled")),
+        "live_safety_enabled": _okai_fix_live_safety_enabled(),
+    }
+
+
+def max_risk_per_trade_percent():
+    return min(1.5, max(0.1, _okai_fix_float(config.get("max_risk_per_trade_percent", 1.0), 1.0)))
+
+
+def _okai_fix_effective_capital_base():
+    if is_live_mode():
+        return max(0.0, _okai_fix_float(capital, 0.0))
+    return max(0.0, _okai_fix_float(paper_capital, capital))
+
+
+def _okai_fix_default_lot_size(option=None):
+    for source in [option or {}, position or {}, (position or {}).get("option") or {}]:
+        lot = _okai_fix_int(source.get("lot_size") or source.get("lotsize") or source.get("lot"), 0) if isinstance(source, dict) else 0
+        if lot > 0:
+            return lot
+    return _okai_fix_int(globals().get("FAST_LOT_SIZE", 65), 65)
+
+
+def _okai_fix_dynamic_risk(entry, option=None):
+    entry = _okai_fix_float(entry, 0.0)
+    if entry <= 0:
+        return 0.0, 0.0, None
+    opt_df = _okai_fix_option_candles(option, allow_network=False)
+    atr14 = _okai_fix_option_atr(opt_df)
+    expiry = is_expiry_day()
+    percent_risk = entry * (15.0 if expiry else 12.0) / 100.0
+    atr_risk = atr14 * (1.5 if expiry else 1.2) if atr14 else 0.0
+    risk = max(percent_risk, atr_risk)
+    return risk, atr14, opt_df
+
+
+def _okai_fix_apply_risk_cap_qty(qty, premium, lot_size, option=None):
+    qty = _okai_fix_int(qty, 0)
+    lot_size = max(1, _okai_fix_int(lot_size, _okai_fix_default_lot_size(option)))
+    premium = _okai_fix_float(premium, 0.0)
+    risk_per_unit, atr14, _df = _okai_fix_dynamic_risk(premium, option)
+    if premium <= 0 or risk_per_unit <= 0:
+        _okai_fix_log("LIVE SAFETY BLOCK | risk cap | premium/risk missing")
+        return 0
+    risk_budget = _okai_fix_effective_capital_base() * max_risk_per_trade_percent() / 100.0
+    allowed_qty = int(risk_budget // risk_per_unit)
+    allowed_qty = (allowed_qty // lot_size) * lot_size
+    capped = max(0, min(qty, allowed_qty))
+    if qty > 0 and capped <= 0:
+        _okai_fix_log(
+            f"LIVE SAFETY BLOCK | risk cap qty zero | premium={premium:.2f} | "
+            f"risk_per_unit={risk_per_unit:.2f} | budget={risk_budget:.2f} | lot={lot_size}"
+        )
+    elif capped < qty:
+        _okai_fix_log(
+            f"RISK CAP | qty {qty}->{capped} | risk_per_trade={max_risk_per_trade_percent():.2f}% | "
+            f"risk_unit={risk_per_unit:.2f} | atr14={atr14 or 0:.2f}"
+        )
+    return capped
+
+
+def get_qty(premium, trade_type, lot_size):
+    qty = _OKAI_FIX_BASE_GET_QTY(premium, trade_type, lot_size)
+    return _okai_fix_apply_risk_cap_qty(qty, premium, lot_size)
+
+
+def backtest_risk_cap_qty(bt_capital, qty, premium, lot_size, sl_percent):
+    qty = _okai_fix_int(qty, 0)
+    lot_size = max(1, _okai_fix_int(lot_size, _okai_fix_default_lot_size()))
+    premium = _okai_fix_float(premium, 0.0)
+    risk_per_unit, _atr14, _df = _okai_fix_dynamic_risk(premium, None)
+    if premium <= 0 or risk_per_unit <= 0:
+        return 0
+    risk_budget = max(0.0, _okai_fix_float(bt_capital, 0.0)) * max_risk_per_trade_percent() / 100.0
+    allowed_qty = int(risk_budget // risk_per_unit)
+    allowed_qty = (allowed_qty // lot_size) * lot_size
+    return max(0, min(qty, allowed_qty))
+
+
+def _okai_fix_option_candles(option=None, allow_network=True):
+    option = option or (position or {}).get("option") or {}
+    token = str(option.get("token") or option.get("symboltoken") or option.get("instrument_token") or "")
+    symbol = str(option.get("symbol") or "")
+    if not token:
+        return None
+    cache_key = token
+    cached = _OKAI_FIX_OPTION_CANDLE_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - cached.get("ts", 0) < 60:
+        return _okai_fix_cache_copy(cached.get("df"))
+    if not allow_network:
+        return _okai_fix_cache_copy(cached.get("df")) if cached else None
+    try:
+        obj = angel_login()
+        end_dt = market_now()
+        start_dt = end_dt - timedelta(minutes=90)
+        params = {
+            "exchange": option.get("exchange", "NFO"),
+            "symboltoken": token,
+            "interval": "ONE_MINUTE",
+            "fromdate": start_dt.strftime("%Y-%m-%d %H:%M"),
+            "todate": end_dt.strftime("%Y-%m-%d %H:%M"),
+        }
+        raw = obj.getCandleData(params)
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"non-json option candle response: {str(raw)[:120]}")
+        rows = raw.get("data") or []
+        if not rows:
+            return _okai_fix_cache_copy(cached.get("df")) if cached else None
+        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        if df.empty:
+            return None
+        _OKAI_FIX_OPTION_CANDLE_CACHE[cache_key] = {"ts": now_ts, "df": df, "symbol": symbol}
+        return df.copy()
+    except Exception as exc:
+        if _okai_fix_is_rate_limit_error(exc):
+            _okai_fix_log(f"OPTION CANDLE RATE LIMIT | {symbol or token} | using cache if available | {str(exc)[:120]}")
+        else:
+            _okai_fix_log(f"OPTION CANDLE ERROR | {symbol or token} | {str(exc)[:120]}")
+        return _okai_fix_cache_copy(cached.get("df")) if cached else None
+
+
+def _okai_fix_option_atr(df, period=14):
+    try:
+        if df is None or len(df) < period + 1:
+            return 0.0
+        high = pd.to_numeric(df["high"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean().dropna()
+        return _okai_fix_float(atr.iloc[-1] if not atr.empty else 0.0, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _okai_fix_option_vwap(df):
+    try:
+        if df is None or df.empty:
+            return None
+        work = df.copy()
+        vol = pd.to_numeric(work.get("volume", 0), errors="coerce").fillna(0)
+        close = pd.to_numeric(work["close"], errors="coerce")
+        if vol.sum() <= 0:
+            return _okai_fix_float(close.mean(), None)
+        return _okai_fix_float((close * vol).sum() / vol.sum(), None)
+    except Exception:
+        return None
+
+
+def _okai_fix_exit_engine_payload(pos=None):
+    pos = pos or position or {}
+    engine = dict(pos.get("exit_engine") or {})
+    if not engine:
+        return None
+    keys = ["sl", "R", "t1", "t2", "trail_stage", "atr14", "vwap", "last_trail_reason"]
+    return {key: engine.get(key) for key in keys}
+
+
+def _okai_fix_init_exit_engine(pos, option=None):
+    if not isinstance(pos, dict):
+        return None
+    entry = _okai_fix_float(pos.get("entry"), 0.0)
+    if entry <= 0:
+        return None
+    option = option or pos.get("option") or {}
+    opt_df = _okai_fix_option_candles(option, allow_network=True)
+    atr14 = _okai_fix_option_atr(opt_df)
+    expiry = is_expiry_day()
+    risk = max(entry * ((15.0 if expiry else 12.0) / 100.0), atr14 * (1.5 if expiry else 1.2))
+    if risk <= 0:
+        risk = entry * ((15.0 if expiry else 12.0) / 100.0)
+    sl = round(max(0.05, entry - risk), 2)
+    r_value = round(max(entry - sl, 0.05), 2)
+    t1 = round(entry + 1.2 * r_value, 2)
+    t2 = round(entry + 2.0 * r_value, 2)
+    vwap = _okai_fix_option_vwap(opt_df)
+    old_engine = pos.get("exit_engine") if isinstance(pos.get("exit_engine"), dict) else {}
+    engine = {
+        "enabled": True,
+        "source": "HYBRID_DYNAMIC_EXIT",
+        "entry": round(entry, 2),
+        "sl": sl,
+        "R": r_value,
+        "t1": t1,
+        "t2": t2,
+        "trail_stage": old_engine.get("trail_stage", "INIT"),
+        "atr14": round(atr14, 2) if atr14 else 0.0,
+        "vwap": round(vwap, 2) if vwap else None,
+        "last_trail_reason": old_engine.get("last_trail_reason", "initial dynamic risk"),
+        "last_sl": _okai_fix_float(old_engine.get("last_sl"), sl),
+    }
+    pos["exit_engine"] = engine
+    pos["sl"] = sl
+    pos["target"] = t2
+    pos["t1"] = t1
+    pos["t2"] = t2
+    pos["target_source"] = "HYBRID_DYNAMIC_EXIT"
+    pos["initial_risk"] = r_value
+    pos["risk_per_unit"] = r_value
+    pos["atr14"] = atr14
+    return engine
+
+
+def _okai_fix_sync_target_source(pos=None):
+    pos = pos or position
+    if not isinstance(pos, dict):
+        return
+    engine = pos.get("exit_engine") if isinstance(pos.get("exit_engine"), dict) else None
+    if not engine:
+        return
+    pos["sl"] = _okai_fix_float(engine.get("sl"), pos.get("sl"))
+    pos["target"] = _okai_fix_float(engine.get("t2"), pos.get("target"))
+    pos["t1"] = _okai_fix_float(engine.get("t1"), pos.get("t1"))
+    pos["t2"] = _okai_fix_float(engine.get("t2"), pos.get("t2"))
+    pos["target_source"] = "HYBRID_DYNAMIC_EXIT"
+
+
+def _okai_fix_update_exit_engine(pos, premium):
+    if not isinstance(pos, dict):
+        return False
+    if not isinstance(pos.get("exit_engine"), dict):
+        _okai_fix_init_exit_engine(pos, pos.get("option") or {})
+    engine = pos.get("exit_engine") or {}
+    entry = _okai_fix_float(engine.get("entry", pos.get("entry")), 0.0)
+    r_value = _okai_fix_float(engine.get("R"), 0.0)
+    ltp = _okai_fix_float(premium, 0.0)
+    old_sl = _okai_fix_float(engine.get("sl", pos.get("sl")), 0.0)
+    if entry <= 0 or r_value <= 0 or ltp <= 0:
+        return False
+    candidate = old_sl
+    reasons = []
+    stage = str(engine.get("trail_stage") or "INIT")
+    progress = ltp - entry
+    if progress >= 0.8 * r_value:
+        candidate = max(candidate, entry)
+        stage = "BREAKEVEN_0.8R"
+        reasons.append("+0.8R breakeven")
+    if progress >= 1.2 * r_value:
+        candidate = max(candidate, entry + 0.5 * r_value)
+        stage = "LOCK_0.5R"
+        reasons.append("+1.2R lock entry+0.5R")
+    if progress >= 1.8 * r_value:
+        candidate = max(candidate, entry + 1.0 * r_value)
+        stage = "TRAIL_1.8R"
+        reasons.append("+1.8R lock entry+1R")
+        opt_df = _okai_fix_option_candles(pos.get("option") or {}, allow_network=True)
+        if opt_df is not None and len(opt_df) >= 2:
+            last2_low = _okai_fix_float(pd.to_numeric(opt_df["low"], errors="coerce").tail(2).min(), 0.0)
+            if last2_low > 0:
+                candidate = max(candidate, last2_low)
+                reasons.append("last 2 option candle low trail")
+            vwap = _okai_fix_option_vwap(opt_df)
+            engine["vwap"] = round(vwap, 2) if vwap else engine.get("vwap")
+            last_close = _okai_fix_float(pd.to_numeric(opt_df["close"], errors="coerce").iloc[-1], 0.0)
+            side = str(pos.get("signal") or "").upper()
+            if vwap and last_close:
+                if side == "CE" and last_close < vwap:
+                    candidate = max(candidate, min(ltp * 0.98, last_close))
+                    reasons.append("CE premium close below option VWAP tighten")
+                if side == "PE" and last_close > vwap:
+                    candidate = max(candidate, min(ltp * 0.98, last_close))
+                    reasons.append("PE premium close above option VWAP tighten")
+    if candidate > old_sl and candidate < ltp:
+        new_sl = round(candidate, 2)
+        engine["sl"] = new_sl
+        engine["trail_stage"] = stage
+        engine["last_sl"] = old_sl
+        engine["last_trail_reason"] = "; ".join(reasons[-3:]) or "hybrid trail"
+        pos["sl"] = new_sl
+        pos["exit_engine"] = engine
+        _okai_fix_log(
+            f"TRAIL UPDATE | side={str(pos.get('signal') or '').upper()} | "
+            f"old_sl={old_sl:.2f} | new_sl={new_sl:.2f} | reason={engine['last_trail_reason']}"
+        )
+        try:
+            save_active_position_state("hybrid_exit_trail")
+        except Exception:
+            pass
+        return True
+    _okai_fix_sync_target_source(pos)
+    return False
+
+
+def update_trailing_sl(*args, **kwargs):
+    if position is None:
+        return None
+    return _okai_fix_update_exit_engine(position, position.get("ltp", position.get("entry", 0)))
+
+
+def update_backtest_trailing_sl(position_bt, ltp):
+    if isinstance(position_bt, dict):
+        if not isinstance(position_bt.get("exit_engine"), dict):
+            _okai_fix_init_exit_engine(position_bt, position_bt.get("option") or {})
+        return _okai_fix_update_exit_engine(position_bt, ltp)
+    return None
+
+
+def _open_position_after_entry(signal, premium, trade_type, option, qty, mode, live_order_id="", live_order_response=None):
+    pos = _OKAI_FIX_BASE_OPEN_POSITION(signal, premium, trade_type, option, qty, mode, live_order_id, live_order_response)
+    try:
+        if pos:
+            _okai_fix_init_exit_engine(pos, option)
+            _okai_fix_sync_target_source(pos)
+            lot = _okai_fix_default_lot_size(option)
+            pos["lot_size"] = lot
+            pos["lots"] = (_okai_fix_int(pos.get("qty"), 0) // lot) if lot > 0 else 0
+            _okai_fix_log(
+                f"CAPITAL DEBUG | entry_open | mode={mode} | capital={_okai_fix_float(capital):.2f} | "
+                f"paper_capital={_okai_fix_float(paper_capital):.2f} | daily_pnl={_okai_fix_float(daily_pnl):.2f} | "
+                f"qty={pos.get('qty')} | lots={pos.get('lots')}"
+            )
+    except Exception as exc:
+        _okai_fix_log(f"Hybrid exit init skipped: {str(exc)[:120]}")
+    return pos
+
+
+def manage_paper_trade(premium, current_price=None):
+    global position
+    if position is None:
+        return
+    premium = _okai_fix_float(premium, position.get("ltp", position.get("entry", 0)))
+    position["ltp"] = premium
+    _okai_fix_update_exit_engine(position, premium)
+    _okai_fix_sync_target_source(position)
+    sl = _okai_fix_float(position.get("sl"), 0.0)
+    t2 = _okai_fix_float(position.get("target"), 0.0)
+    if sl > 0 and premium <= sl:
+        close_position(premium, "HYBRID SL/TRAIL HIT")
+        return
+    if t2 > 0 and premium >= t2:
+        close_position(premium, "HYBRID T2 TARGET HIT")
+        return
+    try:
+        check_partial_exit()
+    except Exception:
+        pass
+
+
+def close_position(exit_price, reason):
+    before = {
+        "mode": str((position or {}).get("mode", trade_mode()) or "").upper() if position else trade_mode(),
+        "capital": _okai_fix_float(capital),
+        "paper_capital": _okai_fix_float(paper_capital),
+        "daily_pnl": _okai_fix_float(daily_pnl),
+        "position": dict(position or {}),
+    }
+    result = _OKAI_FIX_BASE_CLOSE_POSITION(exit_price, reason)
+    try:
+        _okai_fix_log(
+            f"CAPITAL DEBUG | exit_realized | mode={before['mode']} | "
+            f"before_capital={before['capital']:.2f} | after_capital={_okai_fix_float(capital):.2f} | "
+            f"paper_capital={_okai_fix_float(paper_capital):.2f} | before_daily={before['daily_pnl']:.2f} | "
+            f"after_daily={_okai_fix_float(daily_pnl):.2f} | realized={_okai_fix_float(result, 0):.2f} | reason={reason}"
+        )
+    except Exception:
+        pass
+    return result
+
+
+def place_live_order(option, transaction_type, qty, reason=""):
+    tx = str(transaction_type or "").upper()
+    if tx == "BUY" and (not is_live_mode() or not live_trading_enabled() or not _okai_fix_live_safety_enabled()):
+        block = (
+            f"ORDER ROUTE BLOCK | mode={trade_mode()} | live_enabled={live_trading_enabled()} | "
+            f"live_safety={_okai_fix_live_safety_enabled()} | broker BUY blocked"
+        )
+        _okai_fix_log(block)
+        raise RuntimeError(block)
+    _okai_fix_log(f"ORDER ROUTE | mode={trade_mode()} | tx={tx} | qty={qty} | reason={reason}")
+    return _OKAI_FIX_BASE_PLACE_LIVE_ORDER(option, transaction_type, qty, reason)
+
+
+def place_paper_trade(signal, premium, trade_type="FULL", option=None):
+    if is_live_mode():
+        if not live_trading_enabled() or not _okai_fix_live_safety_enabled():
+            reason = "LIVE mode entry blocked: live safety or live trading disabled"
+            _okai_fix_log(f"LIVE SAFETY BLOCK | {reason}")
+            update_trade_suggestion(None, "NONE", last_score, last_confidence, reason, last_nifty_price, option)
+            return None
+        _okai_fix_log("ORDER ROUTE | mode=LIVE | strategy entry may place broker BUY after safety gates")
+        return _OKAI_FIX_BASE_PLACE_PAPER_TRADE(signal, premium, trade_type, option)
+    _okai_fix_log("ORDER ROUTE | mode=PAPER | broker order suppressed")
+    paper_base = globals().get("_OKAI_LIVE_ONLY_BASE_PLACE_PAPER_TRADE") or _OKAI_FIX_BASE_PLACE_PAPER_TRADE
+    return paper_base(signal, premium, trade_type, option)
+
+
+def _okai_fix_strategy_score_breakdown():
+    context = globals().get("last_intelligence_context") if isinstance(globals().get("last_intelligence_context"), dict) else {}
+    decision = globals().get("last_weighted_decision") if isinstance(globals().get("last_weighted_decision"), dict) else {}
+    suggestion = last_trade_suggestion if isinstance(last_trade_suggestion, dict) else {}
+    components = context.get("components") or decision.get("components") or {}
+
+    def comp(*names):
+        for name in names:
+            data = components.get(name) if isinstance(components, dict) else None
+            if isinstance(data, dict):
+                return {
+                    "score": data.get("score"),
+                    "weight": data.get("weight"),
+                    "status": "OK" if _okai_fix_float(data.get("score"), 0) > 0 else "WAIT",
+                    "reason": data.get("reason", ""),
+                }
+        return {"score": None, "weight": None, "status": "NEUTRAL", "reason": ""}
+
+    adx_value = None
+    try:
+        adx_snapshot = _okai_fix_compute_adx_from_ohlc(last_candle_df)
+        adx_value = adx_snapshot.get("adx14") if adx_snapshot else None
+    except Exception:
+        pass
+    total = decision.get("score", context.get("weighted_score", last_score))
+    confidence = decision.get("confidence", context.get("confidence", last_confidence))
+    final_reason = (
+        suggestion.get("reason")
+        or decision.get("reason")
+        or context.get("reason")
+        or context.get("summary")
+        or "Waiting for setup"
+    )
+    breakdown = {
+        "vwap": comp("vwap_alignment", "vwap"),
+        "supertrend": comp("supertrend", "trend"),
+        "ema": comp("ema_alignment", "ema"),
+        "volume": comp("volume_spike", "volume"),
+        "mtf": context.get("multi_timeframe") or context.get("mtf") or {},
+        "orb": comp("orb_breakout", "orb"),
+        "adx": {
+            "value": adx_value,
+            "status": "NEUTRAL" if adx_value in (None, 0, 0.0) else "OK",
+            "reason": "ADX missing is neutral; no hard block" if adx_value in (None, 0, 0.0) else f"ADX {float(adx_value):.2f}",
+        },
+        "fake_breakout": decision.get("fake_breakout_probability", suggestion.get("fake_breakout_probability")),
+        "premium_momentum": comp("premium_momentum", "option_chain_support", "oi_buildup"),
+        "total_score": total,
+        "confidence": confidence,
+        "final_reason": str(final_reason)[:500],
+        "weighted_min_entry_score": 82,
+    }
+    return json_safe(breakdown)
+
+
+def get_position_payload():
+    payload = _OKAI_FIX_BASE_GET_POSITION_PAYLOAD()
+    if not payload or not position:
+        return payload
+    try:
+        lot = _okai_fix_default_lot_size(position.get("option") or {})
+        qty = _okai_fix_int(position.get("qty"), 0)
+        lots = qty // lot if lot > 0 else 0
+        payload.update({
+            "mode": position.get("mode", trade_mode()),
+            "lot_size": lot,
+            "lots": lots,
+            "qty_text": f"Qty: {qty} / Lots: {lots}",
+            "t1": position.get("t1"),
+            "t2": position.get("t2"),
+            "target_source": position.get("target_source", "HYBRID_DYNAMIC_EXIT"),
+            "exit_engine": _okai_fix_exit_engine_payload(position),
+        })
+    except Exception:
+        pass
+    return payload
+
+
+def _okai_fix_equity_curve():
+    curve = []
+    running = _okai_fix_float(paper_capital, capital)
+    for trade in list(trade_history or [])[-80:]:
+        running += _okai_fix_float(trade.get("net_pnl", trade.get("pnl", 0)), 0)
+        curve.append({
+            "time": trade.get("exit_time") or trade.get("date") or trade.get("time") or "",
+            "equity": round(running, 2),
+        })
+    return curve
+
+
+def _okai_fix_markers():
+    entries = []
+    exits = []
+    if position:
+        entries.append({
+            "time": position.get("entry_time") or position.get("time") or "",
+            "price": _okai_fix_float(position.get("entry"), 0),
+            "side": position.get("signal"),
+            "symbol": (position.get("option") or {}).get("symbol", ""),
+        })
+    for trade in list(trade_history or [])[-40:]:
+        entries.append({
+            "time": trade.get("time") or trade.get("entry_time") or "",
+            "price": _okai_fix_float(trade.get("entry"), 0),
+            "side": trade.get("signal"),
+            "symbol": trade.get("symbol", ""),
+        })
+        exits.append({
+            "time": trade.get("exit_time") or "",
+            "price": _okai_fix_float(trade.get("exit"), 0),
+            "side": trade.get("signal"),
+            "pnl": _okai_fix_float(trade.get("net_pnl", trade.get("pnl", 0)), 0),
+            "reason": trade.get("reason", ""),
+        })
+    return entries[-40:], exits[-40:]
+
+
+def _okai_fix_enrich_chart(base, allow_option_network=False):
+    payload = dict(base or {})
+    closes = payload.get("close") or []
+    payload["state"] = "ready" if closes else "empty"
+    if not closes:
+        payload["message"] = payload.get("message") or "Waiting for chart data"
+    opt_df = _okai_fix_option_candles((position or {}).get("option") or {}, allow_network=allow_option_network)
+    payload["option_premium"] = []
+    if opt_df is not None and not opt_df.empty:
+        limit = len(closes) or 120
+        payload["option_premium"] = [round(_okai_fix_float(v), 2) for v in opt_df["close"].tail(limit).tolist()]
+    entries, exits = _okai_fix_markers()
+    payload["entry_markers"] = entries
+    payload["exit_markers"] = exits
+    payload["equity_curve"] = _okai_fix_equity_curve()
+    payload["exit_engine"] = _okai_fix_exit_engine_payload()
+    return json_safe(payload)
+
+
+def status_chart_payload():
+    try:
+        return _okai_fix_enrich_chart(_OKAI_FIX_BASE_STATUS_CHART_PAYLOAD(), allow_option_network=False)
+    except Exception as exc:
+        return _okai_fix_enrich_chart(empty_chart_payload(f"Chart error: {exc}"), allow_option_network=False)
+
+
+def chart_payload():
+    try:
+        return _okai_fix_enrich_chart(_OKAI_FIX_BASE_CHART_PAYLOAD(), allow_option_network=True)
+    except Exception as exc:
+        payload = empty_chart_payload(f"Chart error: {exc}")
+        payload["state"] = "error"
+        payload["error"] = str(exc)[:180]
+        return _okai_fix_enrich_chart(payload, allow_option_network=False)
+
+
+def _okai_fix_capital_debug_payload():
+    return {
+        "mode": trade_mode(),
+        "paper_capital": _okai_fix_float(paper_capital),
+        "live_capital": _okai_fix_float(capital),
+        "daily_pnl": _okai_fix_float(daily_pnl),
+        "realized_updates_only_on_exit": True,
+        "risk_per_trade_percent": max_risk_per_trade_percent(),
+    }
+
+
+def status_payload():
+    payload = _OKAI_FIX_BASE_STATUS_PAYLOAD()
+    try:
+        _okai_fix_sync_target_source(position)
+        payload["server_version"] = SERVER_VERSION
+        payload["mode"] = trade_mode()
+        payload["trade_mode"] = trade_mode()
+        payload["live_trading_enabled"] = live_trading_enabled()
+        payload["live_safety_enabled"] = _okai_fix_live_safety_enabled()
+        payload["paper_capital"] = _okai_fix_float(paper_capital)
+        payload["capital"] = _okai_fix_float(capital)
+        payload["capital_debug"] = _okai_fix_capital_debug_payload()
+        payload["position"] = get_position_payload()
+        payload["exit_engine"] = _okai_fix_exit_engine_payload()
+        payload["strategy_score_breakdown"] = _okai_fix_strategy_score_breakdown()
+        payload["score_breakdown"] = payload["strategy_score_breakdown"]
+        payload["chart"] = status_chart_payload()
+        payload["chart_count"] = len((payload.get("chart") or {}).get("close") or [])
+        if isinstance(payload.get("suggestion"), dict):
+            payload["suggestion"]["score_breakdown"] = payload["strategy_score_breakdown"]
+            if position and isinstance(position.get("exit_engine"), dict):
+                payload["suggestion"]["sl"] = position.get("sl")
+                payload["suggestion"]["target"] = position.get("target")
+                payload["suggestion"]["t1"] = position.get("t1")
+                payload["suggestion"]["t2"] = position.get("t2")
+                payload["suggestion"]["exit_engine"] = _okai_fix_exit_engine_payload(position)
+            lot = _okai_fix_default_lot_size(payload.get("suggestion"))
+            qty = _okai_fix_int(payload["suggestion"].get("qty"), 0)
+            payload["suggestion"]["lot_size"] = payload["suggestion"].get("lot_size") or lot
+            payload["suggestion"]["lots"] = qty // lot if lot and qty else 0
+    except Exception as exc:
+        payload["final_patch_error"] = str(exc)[:180]
+    return json_safe(payload)
+
+
+def build_live_text():
+    text = _OKAI_FIX_BASE_BUILD_LIVE_TEXT()
+    try:
+        breakdown = _okai_fix_strategy_score_breakdown()
+        engine = _okai_fix_exit_engine_payload() or {}
+        extra = [
+            "",
+            "Strategy Score Breakdown:",
+            f"VWAP: {breakdown.get('vwap', {}).get('score', '--')} | EMA: {breakdown.get('ema', {}).get('score', '--')} | Volume: {breakdown.get('volume', {}).get('score', '--')}",
+            f"ORB: {breakdown.get('orb', {}).get('score', '--')} | ADX: {breakdown.get('adx', {}).get('value', 'neutral')} | Premium: {breakdown.get('premium_momentum', {}).get('score', '--')}",
+            f"Total: {breakdown.get('total_score', '--')}/100 | Confidence: {breakdown.get('confidence', '--')}",
+            f"Reason: {breakdown.get('final_reason', '--')}",
+        ]
+        if engine:
+            extra.extend([
+                "",
+                "Exit Engine:",
+                f"SL {engine.get('sl')} | R {engine.get('R')} | T1 {engine.get('t1')} | T2 {engine.get('t2')} | Stage {engine.get('trail_stage')}",
+            ])
+        return text + "\n".join(extra)
+    except Exception:
+        return text
+
+
+def build_risk_text():
+    return _OKAI_FIX_BASE_BUILD_RISK_TEXT() + (
+        "\n\nHybrid Dynamic Exit + Risk Cap v31:\n"
+        "Initial SL uses max(12% premium, 1.2x option ATR14), expiry uses max(15%, 1.5x ATR14). "
+        "T1=1.2R, T2=2R, trail locks at 0.8R/1.2R/1.8R, then last-2 option candle lows. "
+        f"Max risk/trade default {max_risk_per_trade_percent():.2f}% capped at 1.5%; qty is reduced to lot-size multiples."
+    )
+
+
+def build_settings_text():
+    return _OKAI_FIX_BASE_BUILD_SETTINGS_TEXT() + (
+        "\n\nMode/ADX/Exit Fix v31:\n"
+        "Paper/Live mode now persists from app/API. Paper mode never routes broker BUY. "
+        "LIVE BUY needs live_trading_enabled and live_safety_enabled. ADX missing is neutral, not a 0.0 hard block."
+    )
+
+
+def _okai_fix_handler_do_get(self):
+    if not self.authorized():
+        self.send_json({"ok": False, "error": "unauthorized"}, 401)
+        return
+    path = urlparse(self.path).path
+    if path == "/backtest":
+        details = dict(_OKAI_FIX_LAST_BACKTEST_DETAILS or {})
+        details["summary"] = last_backtest_summary
+        details["report"] = last_backtest_report
+        self.send_json({
+            "ok": True,
+            "summary": last_backtest_summary,
+            "report": last_backtest_report,
+            "data": json_safe(details),
+        })
+        return
+    return _OKAI_FIX_BASE_HANDLER_DO_GET(self)
+
+
+def _okai_fix_handler_do_post(self):
+    if not self.authorized():
+        self.send_json({"ok": False, "error": "unauthorized"}, 401)
+        return
+    path = urlparse(self.path).path
+    if path in {"/set-paper-mode", "/set-live-mode", "/mode"}:
+        body = self.read_body()
+        try:
+            if path == "/set-paper-mode":
+                data = set_trade_mode("PAPER", False)
+            elif path == "/set-live-mode":
+                data = set_trade_mode("LIVE", body.get("live_trading_enabled", True))
+            else:
+                data = set_trade_mode(body.get("trade_mode", body.get("mode")), body.get("live_trading_enabled"))
+            self.send_json({"ok": True, "message": "trade mode updated", "data": data})
+        except Exception as exc:
+            self.send_json({"ok": False, "error": str(exc)}, 400)
+        return
+    return _OKAI_FIX_BASE_HANDLER_DO_POST(self)
+
+
+Handler.do_GET = _okai_fix_handler_do_get
+Handler.do_POST = _okai_fix_handler_do_post
+
+
+# ===== END PATCH: BUGFIX + HYBRID EXIT ENGINE =====
+
+
 if __name__ == "__main__":
     main()
