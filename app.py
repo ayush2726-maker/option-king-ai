@@ -6397,9 +6397,18 @@ def set_trade_mode(mode=None, live_enabled=None):
         mode = str(mode or "PAPER").strip().upper()
         if mode not in {"PAPER", "LIVE"}:
             raise RuntimeError("trade_mode must be PAPER or LIVE")
+        # Keep BOTH keys in sync to avoid drift between subsystems
         config["trade_mode"] = mode
+        config["mode"] = mode
+        # If switching to PAPER, also disable live trading flag to be safe
+        if mode == "PAPER":
+            config["live_trading_enabled"] = False
     if live_enabled is not None:
-        config["live_trading_enabled"] = bool(live_enabled)
+        # Never allow live_enabled=True when mode is PAPER
+        if bool(live_enabled) and trade_mode() == "PAPER":
+            gui_log("Refused to enable live_trading_enabled: trade_mode is PAPER")
+        else:
+            config["live_trading_enabled"] = bool(live_enabled)
     save_cloud_config()
     gui_log(f"Trade mode updated | Mode {trade_mode()} | Live enabled {'YES' if live_trading_enabled() else 'NO'}")
     return {"trade_mode": trade_mode(), "live_trading_enabled": live_trading_enabled()}
@@ -21039,8 +21048,8 @@ def _tqu_adx_weak_threshold():
     return _okai_config_float("tqu_adx_weak_threshold", 25.0, 15.0, 40.0)
 
 def _tqu_sideways_min_score():
-    """Score needed to trade in SIDEWAYS regime. Default 88."""
-    return _okai_config_float("tqu_sideways_min_score", 88.0, 80.0, 100.0)
+    """Score needed to trade in SIDEWAYS regime. Default 68 (was 88)."""
+    return _okai_config_float("tqu_sideways_min_score", 68.0, 50.0, 100.0)
 
 def _tqu_min_rr():
     """Minimum Risk:Reward ratio. Default 1.5."""
@@ -21227,24 +21236,41 @@ def _tqu_strict_entry_rules(signal, setup, df):
 # ── Sideways guard ───────────────────────────────────────────────────────────
 def _tqu_sideways_check(setup):
     """
-    Block SIDEWAYS market unless score > tqu_sideways_min_score AND volume spike.
-    Returns (pass: bool, reason: str)
+    SIDEWAYS market handling.
+    Hard block only when score is weak. Allow with caution if score is decent.
+    Returns (pass: bool, reason: str). When pass=True with caution, setup is tagged.
     """
     regime = str(setup.get("market_regime", "") or "").upper()
     if not any(kw in regime for kw in ("SIDEWAYS", "CHOPPY", "RANGE", "FLAT")):
         return True, f"Regime {regime}: OK"
 
     score = float(setup.get("score", 0) or 0)
-    min_score = _tqu_sideways_min_score()
+    weighted_score = float(setup.get("weighted_score", setup.get("score", 0)) or 0)
+    core_score = float(setup.get("core_score", 0) or 0)        # 0..5 typically
+    min_score = _tqu_sideways_min_score()                      # default 68 now
     vol_spike = float(setup.get("volume_spike", {}).get("score", 0) or 0) if isinstance(setup.get("volume_spike"), dict) else 0
     vol_ratio = float(setup.get("volume_ratio", 1.0) or 1.0)
+    min_vol   = _okai_config_float("tqu_sideways_min_vol_ratio", 1.2, 0.8, 3.0)
 
-    if score > min_score and (vol_spike >= 8 or vol_ratio >= 1.8):
-        return True, f"SIDEWAYS allowed: score {score:.0f}>{min_score:.0f} + vol spike {vol_ratio:.1f}x"
+    # Strong path — score above min + vol confirmation
+    if score > min_score and (vol_spike >= 6 or vol_ratio >= min_vol):
+        return True, f"SIDEWAYS allowed: score {score:.0f}>{min_score:.0f} + vol {vol_ratio:.1f}x"
+
+    # CAUTION path — strong core + weighted score, even if volume is meh
+    if core_score >= 4 and weighted_score >= 78:
+        setup["sideways_caution"] = True
+        setup.setdefault("modifiers", []).append(
+            f"SIDEWAYS CAUTION: core {core_score:.0f}/5 + weighted {weighted_score:.0f}, vol {vol_ratio:.1f}x"
+        )
+        return True, (
+            f"SIDEWAYS CAUTION allowed: core={core_score:.0f}/5 weighted={weighted_score:.0f} "
+            f"vol={vol_ratio:.1f}x"
+        )
 
     return False, (
         f"SIDEWAYS blocked: regime={regime}, score={score:.0f}"
-        f"(need>{min_score:.0f}), vol={vol_ratio:.1f}x(need>1.8x)"
+        f"(need>{min_score:.0f}), vol={vol_ratio:.1f}x(need>{min_vol:.1f}x), "
+        f"core={core_score:.0f}/5, weighted={weighted_score:.0f}"
     )
 
 
@@ -21370,7 +21396,14 @@ def compute_weighted_setup(signal, df, price):
     # ── 3. Multi-timeframe confirmation ─────────────────────────
     mtf_ok, mtf_reason = _tqu_5m_trend(signal)
     if not mtf_ok:
-        rejects.append(mtf_reason)
+        # Soft block: if weighted_score is strong (>=78), turn into warning instead of hard reject
+        w_score = float(setup.get("weighted_score", setup.get("score", 0)) or 0)
+        mtf_strong_override = _okai_config_float("tqu_mtf_strong_override", 78.0, 60.0, 100.0)
+        if w_score >= mtf_strong_override:
+            warnings.append(f"MTF warning (overridden by weighted {w_score:.0f}>={mtf_strong_override:.0f}): {mtf_reason}")
+            setup.setdefault("modifiers", []).append("MTF_OVERRIDE_STRONG")
+        else:
+            rejects.append(mtf_reason)
     else:
         setup.setdefault("modifiers", []).append(mtf_reason)
 
@@ -21418,8 +21451,48 @@ def compute_weighted_setup(signal, df, price):
         setup["trade_type"] = "NONE"
         setup["size_factor"] = 0.0
         setup["tqu_block_reason"] = reject_str
+        # ── NO TRADE SUMMARY (rate-limited to ~once per minute) ──
+        try:
+            _emit_no_trade_summary(setup, rejects)
+        except Exception:
+            pass
 
     return setup
+
+
+# ── NO TRADE SUMMARY (1-minute rate-limited compact log) ─────────────────────
+_no_trade_summary_last_ts = 0.0
+_no_trade_summary_min_gap = 60.0   # seconds
+
+def _classify_no_trade_reason(rejects):
+    """Pick the most user-friendly reason category from a list of rejects."""
+    text = " | ".join(str(r) for r in rejects).upper()
+    for tag in ("SIDEWAYS", "MTF", "VOLUME", "ADX", "COOLDOWN", "VWAP", "EMA", "SUPERTREND"):
+        if tag in text:
+            return tag
+    return "SCORE"
+
+def _emit_no_trade_summary(setup, rejects):
+    """Compact, rate-limited 'NO TRADE SUMMARY' log line for fast diagnosis."""
+    global _no_trade_summary_last_ts
+    now = time.time()
+    if now - _no_trade_summary_last_ts < _no_trade_summary_min_gap:
+        return
+    _no_trade_summary_last_ts = now
+
+    reason   = _classify_no_trade_reason(rejects)
+    score    = float(setup.get("score", 0) or 0)
+    weighted = float(setup.get("weighted_score", setup.get("score", 0)) or 0)
+    need     = _tqu_sideways_min_score() if reason == "SIDEWAYS" else 78.0
+    vol      = float(setup.get("volume_ratio", 1.0) or 1.0)
+    try:
+        mode = trade_mode()
+    except Exception:
+        mode = str(config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER")
+    gui_log(
+        f"NO TRADE SUMMARY | reason={reason} | score={score:.0f} "
+        f"(weighted={weighted:.0f}) | need={need:.0f} | vol={vol:.1f}x | mode={mode}"
+    )
 
 
 # ── Wrap enforce_weighted_execution_rules — log every WAIT reason ─────────────
