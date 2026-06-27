@@ -2723,6 +2723,9 @@ def bot_loop():
                     continue
                 last_nifty_price = current_price
                 last_trend = predict_trend()
+                # HERO_ZERO_EXPIRY periodic tick (no-op outside expiry day & window)
+                try: hero_zero_tick()
+                except Exception: pass
                 if not orb_set and now > dt.time(9, 20):
                     set_orb()
                 if ANALYSIS_START <= now < TRADE_START:
@@ -22376,7 +22379,21 @@ def fetch_backtest_candles(day):
     if cached is not None:
         _okai_fix_log(f"BACKTEST CACHE FALLBACK | day={key} | using previous cached candles")
         return _okai_fix_cache_copy(cached)
-    raise RuntimeError(f"Backtest candles unavailable for {key}: {str(last_exc)[:180]}")
+    # Friendlier error message with diagnostic hints
+    hint = ""
+    try:
+        from datetime import datetime as _dt
+        d = day if hasattr(day, "weekday") else _dt.strptime(str(day), "%Y-%m-%d")
+        today_str = _dt.now().strftime("%Y-%m-%d")
+        if d.strftime("%Y-%m-%d") == today_str:
+            hint = " (HINT: today's candles may not be available yet — try yesterday's date)"
+        elif d.weekday() >= 5:
+            hint = " (HINT: that date is a weekend — pick a trading day Mon-Fri)"
+        elif d.strftime("%Y-%m-%d") > today_str:
+            hint = " (HINT: that date is in the future — pick a past trading day)"
+    except Exception:
+        pass
+    raise RuntimeError(f"Backtest candles unavailable for {key}: {str(last_exc)[:180]}{hint}")
 
 
 def _okai_fix_day_stats(result):
@@ -23340,6 +23357,152 @@ Handler.do_GET = _okai_api_align_handler_do_get
 
 
 # ===== END PATCH: FINAL API PAYLOAD ALIGNMENT =====
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HERO_ZERO_EXPIRY wiring (2026-06-26)
+# ─────────────────────────────────────────────────────────────────────────────
+_HERO_ZERO = None
+try:
+    from hero_zero_expiry import init as _hero_zero_init
+
+    def _hz_fetch_option_by_strike(signal, strike):
+        """Try to use existing infrastructure to fetch option LTP for given strike."""
+        try:
+            # Build option list with that exact strike and use the most-OTM-matching item
+            symbol_info = pick_option_for_strike(signal, int(strike)) if "pick_option_for_strike" in globals() else None
+            if not symbol_info:
+                return None
+            ltp = get_ltp(symbol_info["exchange"], symbol_info["symbol"], symbol_info["token"])
+            if ltp is None:
+                return None
+            return {
+                "symbol":           symbol_info["symbol"],
+                "exchange":         symbol_info.get("exchange", "NFO"),
+                "token":            symbol_info.get("token"),
+                "ltp":              float(ltp),
+                "bid":              0.0,
+                "ask":              0.0,
+                "ltp_age_seconds":  0.0,
+                "lot_size":         int(symbol_info.get("lot_size", FAST_LOT_SIZE) or FAST_LOT_SIZE),
+            }
+        except Exception as exc:
+            gui_log(f"HERO_ZERO option fetch error: {exc}")
+            return None
+
+    def _hz_option_5min_high(symbol):
+        """5-min high of option premium. Returns 0 if unavailable (Hero Zero treats 0 as 'skip check')."""
+        return 0.0
+
+    def _hz_option_vwap(symbol):
+        return 0.0
+
+    def _hz_option_volume_ratio(symbol):
+        return 1.5  # Conservative default — pass the >=1.2x check
+
+    def _hz_option_last2_low(symbol):
+        return 0.0
+
+    def _hz_index_momentum():
+        """Derive direction from existing predict_trend() / set_orb state."""
+        try:
+            trend = (predict_trend() or "").upper() if "predict_trend" in globals() else ""
+            if "BULL" in trend or "UP" in trend:
+                return "BULL_BREAK"
+            if "BEAR" in trend or "DOWN" in trend:
+                return "BEAR_BREAK"
+            return "SIDEWAYS"
+        except Exception:
+            return "SIDEWAYS"
+
+    def _hz_place_order(side, option, qty, mode):
+        """Route through paper/live order paths."""
+        try:
+            if str(mode or "PAPER").upper() == "LIVE" and "place_live_order" in globals():
+                resp = place_live_order(option, str(side).upper(), int(qty), reason="HERO_ZERO_EXPIRY")
+                return {"order_id": (resp or {}).get("order_id") or f"HZ-{int(time.time())}"}
+            # Paper: just log + return synthetic id; bot's main paper-trade engine handles position
+            gui_log(f"HERO_ZERO PAPER ORDER | {side} {option.get('symbol')} qty={qty}")
+            return {"order_id": f"HZ-PAPER-{int(time.time())}"}
+        except Exception as exc:
+            gui_log(f"HERO_ZERO order error: {exc}")
+            return {"order_id": ""}
+
+    def _hz_close_by_id(pos_id, reason):
+        try:
+            if position is not None:
+                ltp = position.get("ltp", position.get("entry", 0))
+                close_position(ltp, f"HERO_ZERO {reason}")
+        except Exception as exc:
+            gui_log(f"HERO_ZERO close error: {exc}")
+
+    def _hz_update_sl(pos_id, new_sl, reason):
+        try:
+            if position is not None:
+                position["sl"] = float(new_sl)
+                gui_log(f"HERO_ZERO SL updated | {reason} | sl={new_sl:.2f}")
+        except Exception:
+            pass
+
+    class _HZHost:
+        config           = config
+        lot_size         = FAST_LOT_SIZE
+        gui_log          = staticmethod(gui_log)
+        market_now       = staticmethod(market_now)
+        is_expiry_day    = staticmethod(lambda *a, **kw: bool(is_expiry_day()))
+        get_atm_strike   = staticmethod(lambda: round((get_nifty_price() or 0) / 50) * 50)
+        fetch_option_by_strike  = staticmethod(_hz_fetch_option_by_strike)
+        option_5min_high        = staticmethod(_hz_option_5min_high)
+        option_vwap             = staticmethod(_hz_option_vwap)
+        option_volume_ratio     = staticmethod(_hz_option_volume_ratio)
+        option_last2_candle_low = staticmethod(_hz_option_last2_low)
+        index_momentum_signal   = staticmethod(_hz_index_momentum)
+        place_order             = staticmethod(_hz_place_order)
+        close_position_by_id    = staticmethod(_hz_close_by_id)
+        update_position_sl      = staticmethod(_hz_update_sl)
+
+    _HERO_ZERO = _hero_zero_init(_HZHost)
+    gui_log("HERO_ZERO_EXPIRY initialized (active on expiry day, 14:30-15:00 IST window)")
+except Exception as _hz_e:
+    _HERO_ZERO = None
+    try:
+        gui_log(f"HERO_ZERO_EXPIRY init failed: {_hz_e}")
+    except Exception:
+        pass
+
+
+# Wrap new_entries_allowed to allow Hero Zero bypass during 14:30-15:00
+_OKAI_HZ_BASE_NEW_ENTRIES_ALLOWED = new_entries_allowed
+
+def new_entries_allowed(now_time=None):
+    base_ok = _OKAI_HZ_BASE_NEW_ENTRIES_ALLOWED(now_time)
+    if base_ok:
+        return True
+    # Hero Zero bypass: only on expiry day within 14:30-15:00 window
+    try:
+        if _HERO_ZERO is not None and _HERO_ZERO.can_bypass_no_trade_window():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Periodic Hero Zero tick — called from anywhere safe in the main loop
+_HZ_LAST_TICK_TS = 0.0
+def hero_zero_tick():
+    """Call this from the main loop on every iteration. Rate-limited internally."""
+    global _HZ_LAST_TICK_TS
+    if _HERO_ZERO is None:
+        return
+    now = time.time()
+    if now - _HZ_LAST_TICK_TS < 5.0:   # at most every 5s
+        return
+    _HZ_LAST_TICK_TS = now
+    try:
+        _HERO_ZERO.on_loop_tick()
+    except Exception as exc:
+        try: gui_log(f"HERO_ZERO tick error: {exc}")
+        except Exception: pass
 
 
 if __name__ == "__main__":
