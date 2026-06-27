@@ -23366,66 +23366,216 @@ _HERO_ZERO = None
 try:
     from hero_zero_expiry import init as _hero_zero_init
 
-    def _hz_fetch_option_by_strike(signal, strike):
-        """Try to use existing infrastructure to fetch option LTP for given strike."""
+    # ── Cache for option candles (60s TTL) ─────────────────────────────
+    _hz_option_candle_cache = {}   # key=(token,interval) -> (ts, df)
+    _HZ_OPT_CACHE_TTL = 30.0
+
+    def _hz_option_candles(option, interval="FIVE_MINUTE", lookback_minutes=120):
+        """Fetch option candles via Angel. Returns pandas DataFrame or None."""
         try:
-            # Build option list with that exact strike and use the most-OTM-matching item
-            symbol_info = pick_option_for_strike(signal, int(strike)) if "pick_option_for_strike" in globals() else None
-            if not symbol_info:
+            token = option.get("token")
+            if not token:
                 return None
-            ltp = get_ltp(symbol_info["exchange"], symbol_info["symbol"], symbol_info["token"])
-            if ltp is None:
+            cache_key = (token, interval)
+            cached = _hz_option_candle_cache.get(cache_key)
+            now_ts = time.time()
+            if cached and now_ts - cached[0] < _HZ_OPT_CACHE_TTL:
+                return cached[1].copy()
+
+            angel_login()
+            from_dt = market_now() - dt.timedelta(minutes=lookback_minutes)
+            data = obj.getCandleData({
+                "exchange":    option.get("exchange", "NFO"),
+                "symboltoken": token,
+                "interval":    interval,
+                "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
+                "todate":      market_now().strftime("%Y-%m-%d %H:%M"),
+            })
+            if not isinstance(data, dict) or data.get("status") is False:
                 return None
-            return {
-                "symbol":           symbol_info["symbol"],
-                "exchange":         symbol_info.get("exchange", "NFO"),
-                "token":            symbol_info.get("token"),
-                "ltp":              float(ltp),
-                "bid":              0.0,
-                "ask":              0.0,
-                "ltp_age_seconds":  0.0,
-                "lot_size":         int(symbol_info.get("lot_size", FAST_LOT_SIZE) or FAST_LOT_SIZE),
-            }
-        except Exception as exc:
-            gui_log(f"HERO_ZERO option fetch error: {exc}")
+            rows = data.get("data") or []
+            if not rows:
+                return None
+            df_opt = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df_opt[col] = pd.to_numeric(df_opt[col], errors="coerce")
+            df_opt = df_opt.dropna()
+            if df_opt.empty:
+                return None
+            _hz_option_candle_cache[cache_key] = (now_ts, df_opt.copy())
+            return df_opt
+        except Exception:
             return None
 
+    # State: symbol → option dict (so subsequent helpers can resolve symbol → token)
+    _hz_symbol_cache = {}
+
+    def _hz_fetch_option_by_strike(signal, strike):
+        """Find the nearest-expiry option contract for the given strike + signal."""
+        try:
+            master = get_master()
+            df_m = master[
+                (master["name"] == "NIFTY")
+                & (master["exch_seg"] == "NFO")
+                & (master["instrumenttype"].str.contains("OPT", na=False))
+                & (master["symbol"].str.endswith(signal))
+            ].copy()
+            df_m["expiry_dt"]  = parse_expiry_series(df_m["expiry"])
+            df_m["strike_num"] = pd.to_numeric(df_m["strike"], errors="coerce") / 100
+            df_m = df_m.dropna(subset=["expiry_dt", "strike_num"])
+            df_m = filter_to_nearest_option_expiry(df_m, context=f"hero_zero {signal}")
+            df_m = df_m[df_m["strike_num"] == int(strike)]
+            if df_m.empty:
+                return None
+            row = df_m.sort_values("expiry_dt").iloc[0]
+            option = {
+                "symbol":   row["symbol"],
+                "token":    row["token"],
+                "exchange": row["exch_seg"],
+                "strike":   int(strike),
+                "lot_size": int(float(row["lotsize"])),
+            }
+            ltp = get_ltp(option["exchange"], option["symbol"], option["token"])
+            if ltp is None:
+                return None
+            option["ltp"]             = float(ltp)
+            option["bid"]             = 0.0
+            option["ask"]             = 0.0
+            option["ltp_age_seconds"] = 0.0
+            _hz_symbol_cache[row["symbol"]] = option
+            return option
+        except Exception as exc:
+            try: gui_log(f"HERO_ZERO option fetch error: {exc}")
+            except Exception: pass
+            return None
+
+    def _hz_get_option_by_symbol(symbol):
+        return _hz_symbol_cache.get(symbol)
+
     def _hz_option_5min_high(symbol):
-        """5-min high of option premium. Returns 0 if unavailable (Hero Zero treats 0 as 'skip check')."""
-        return 0.0
+        """Last 5-minute candle's HIGH (option premium). Returns 0 if unavailable."""
+        try:
+            opt = _hz_get_option_by_symbol(symbol)
+            if not opt:
+                return 0.0
+            df_opt = _hz_option_candles(opt, "FIVE_MINUTE", lookback_minutes=60)
+            if df_opt is None or df_opt.empty:
+                return 0.0
+            # Use the LAST CLOSED 5-min candle (second-to-last row) high
+            if len(df_opt) >= 2:
+                return float(df_opt.iloc[-2]["high"])
+            return float(df_opt.iloc[-1]["high"])
+        except Exception:
+            return 0.0
 
     def _hz_option_vwap(symbol):
-        return 0.0
+        """VWAP of option premium across today's intraday candles."""
+        try:
+            opt = _hz_get_option_by_symbol(symbol)
+            if not opt:
+                return 0.0
+            df_opt = _hz_option_candles(opt, "FIVE_MINUTE", lookback_minutes=420)
+            if df_opt is None or df_opt.empty:
+                return 0.0
+            typical = (df_opt["high"] + df_opt["low"] + df_opt["close"]) / 3.0
+            vol = df_opt["volume"].replace(0, 1)  # avoid div-by-zero
+            vwap = float((typical * vol).sum() / vol.sum())
+            return vwap if vwap > 0 else 0.0
+        except Exception:
+            return 0.0
 
     def _hz_option_volume_ratio(symbol):
-        return 1.5  # Conservative default — pass the >=1.2x check
+        """Current 5m candle's volume / 5-candle average. Returns 1.0 if unavailable."""
+        try:
+            opt = _hz_get_option_by_symbol(symbol)
+            if not opt:
+                return 1.0
+            df_opt = _hz_option_candles(opt, "FIVE_MINUTE", lookback_minutes=60)
+            if df_opt is None or len(df_opt) < 6:
+                return 1.0
+            cur_vol = float(df_opt.iloc[-1]["volume"])
+            avg_vol = float(df_opt.iloc[-6:-1]["volume"].mean())
+            if avg_vol <= 0:
+                return 1.0
+            return cur_vol / avg_vol
+        except Exception:
+            return 1.0
 
     def _hz_option_last2_low(symbol):
-        return 0.0
+        """Lowest LOW of the last 2 closed 5-min option candles. Used for trail SL."""
+        try:
+            opt = _hz_get_option_by_symbol(symbol)
+            if not opt:
+                return 0.0
+            df_opt = _hz_option_candles(opt, "FIVE_MINUTE", lookback_minutes=60)
+            if df_opt is None or len(df_opt) < 3:
+                return 0.0
+            # Last 2 CLOSED candles = rows -3 and -2 (ignore the live forming candle -1)
+            return float(min(df_opt.iloc[-3]["low"], df_opt.iloc[-2]["low"]))
+        except Exception:
+            return 0.0
 
     def _hz_index_momentum():
-        """Derive direction from existing predict_trend() / set_orb state."""
+        """Decide direction: BULL_BREAK / BEAR_BREAK / SIDEWAYS based on NIFTY 5m + ORB."""
         try:
-            trend = (predict_trend() or "").upper() if "predict_trend" in globals() else ""
-            if "BULL" in trend or "UP" in trend:
-                return "BULL_BREAK"
-            if "BEAR" in trend or "DOWN" in trend:
-                return "BEAR_BREAK"
+            price = get_nifty_price()
+            if price is None:
+                return "SIDEWAYS"
+            # 1) ORB break
+            try:
+                orb_high = float(globals().get("orb_high", 0) or 0)
+                orb_low  = float(globals().get("orb_low", 0) or 0)
+                if orb_high > 0 and price > orb_high * 1.0005:
+                    return "BULL_BREAK"
+                if orb_low > 0 and price < orb_low * 0.9995:
+                    return "BEAR_BREAK"
+            except Exception:
+                pass
+            # 2) NIFTY 5m trend (EMA9 vs price)
+            df5 = _tqu_get_5m_candles() if "_tqu_get_5m_candles" in globals() else None
+            if df5 is not None and len(df5) >= 10:
+                closes = df5["close"].astype(float).values
+                ema = closes[0]
+                for c in closes[1:]:
+                    ema = ema * 0.8 + c * 0.2
+                last = float(closes[-1])
+                # Need momentum (strong move from EMA)
+                drift = (last - ema) / max(1.0, ema)
+                if drift > 0.0015:
+                    return "BULL_BREAK"
+                if drift < -0.0015:
+                    return "BEAR_BREAK"
             return "SIDEWAYS"
         except Exception:
             return "SIDEWAYS"
 
     def _hz_place_order(side, option, qty, mode):
-        """Route through paper/live order paths."""
+        """Live: route through place_live_order. Paper: create paper position via close_position infra."""
         try:
-            if str(mode or "PAPER").upper() == "LIVE" and "place_live_order" in globals():
-                resp = place_live_order(option, str(side).upper(), int(qty), reason="HERO_ZERO_EXPIRY")
-                return {"order_id": (resp or {}).get("order_id") or f"HZ-{int(time.time())}"}
-            # Paper: just log + return synthetic id; bot's main paper-trade engine handles position
-            gui_log(f"HERO_ZERO PAPER ORDER | {side} {option.get('symbol')} qty={qty}")
+            mode_s = str(mode or "PAPER").upper()
+            if mode_s == "LIVE" and "place_live_order" in globals():
+                resp = place_live_order(option, str(side).upper(), int(qty), reason="HERO_ZERO_EXPIRY") or {}
+                order_id = resp.get("order_id") or resp.get("orderid") or f"HZ-LIVE-{int(time.time())}"
+                gui_log(f"HERO_ZERO LIVE ORDER PLACED | {side} {option.get('symbol')} qty={qty} order_id={order_id}")
+                return {"order_id": order_id, "response": resp}
+            # PAPER path: use _open_position_after_entry if available so paper P&L tracking works
+            try:
+                if "_open_position_after_entry" in globals():
+                    _open_position_after_entry(
+                        signal=str(option.get("symbol", "")[-2:]) or "CE",
+                        premium=float(option.get("ltp", 0)),
+                        trade_type="HERO_ZERO_EXPIRY",
+                        option=option,
+                        qty=int(qty),
+                        mode="PAPER",
+                    )
+            except Exception:
+                pass
+            gui_log(f"HERO_ZERO PAPER ORDER | {side} {option.get('symbol')} qty={qty} @ {option.get('ltp', 0):.2f}")
             return {"order_id": f"HZ-PAPER-{int(time.time())}"}
         except Exception as exc:
-            gui_log(f"HERO_ZERO order error: {exc}")
+            try: gui_log(f"HERO_ZERO order error: {exc}")
+            except Exception: pass
             return {"order_id": ""}
 
     def _hz_close_by_id(pos_id, reason):
@@ -23434,7 +23584,8 @@ try:
                 ltp = position.get("ltp", position.get("entry", 0))
                 close_position(ltp, f"HERO_ZERO {reason}")
         except Exception as exc:
-            gui_log(f"HERO_ZERO close error: {exc}")
+            try: gui_log(f"HERO_ZERO close error: {exc}")
+            except Exception: pass
 
     def _hz_update_sl(pos_id, new_sl, reason):
         try:
@@ -23462,7 +23613,7 @@ try:
         update_position_sl      = staticmethod(_hz_update_sl)
 
     _HERO_ZERO = _hero_zero_init(_HZHost)
-    gui_log("HERO_ZERO_EXPIRY initialized (active on expiry day, 14:30-15:00 IST window)")
+    gui_log("HERO_ZERO_EXPIRY initialized | LIVE+PAPER ready | active 14:30-15:00 on expiry day")
 except Exception as _hz_e:
     _HERO_ZERO = None
     try:

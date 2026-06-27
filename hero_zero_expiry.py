@@ -263,12 +263,41 @@ class HeroZeroExpiry:
             )
             return
 
-        # Place order
+        # Place order — with extra LIVE-mode preflight
         mode = self._trade_mode()
+        if mode == "LIVE":
+            # LIVE preflight: re-fetch LTP fresh + final sanity checks
+            try:
+                fresh = self._fetch_option(signal, strike) or {}
+                fresh_ltp = float(fresh.get("ltp", 0) or 0)
+                if not (HZ_PREMIUM_MIN <= fresh_ltp <= HZ_PREMIUM_MAX):
+                    self._log(f"HERO ZERO BLOCK | reason=LIVE preflight: fresh LTP {fresh_ltp:.2f} out of range")
+                    return
+                # If LTP jumped >10% since initial check, skip (slippage protection)
+                if abs(fresh_ltp - premium) / max(0.01, premium) > 0.10:
+                    self._log(f"HERO ZERO BLOCK | reason=LIVE preflight: LTP jumped >10% ({premium:.2f}->{fresh_ltp:.2f})")
+                    return
+                premium = fresh_ltp
+                option["ltp"] = fresh_ltp
+                # Re-check capital cap with fresh premium
+                per_lot_cost = premium * lot
+                max_lots = int(math.floor(HZ_MAX_CAPITAL / per_lot_cost))
+                qty = max_lots * lot
+                if qty < lot:
+                    self._log(f"HERO ZERO BLOCK | reason=LIVE preflight: fresh qty<lot after price move")
+                    return
+            except Exception as e:
+                self._log(f"HERO ZERO BLOCK | reason=LIVE preflight error ({e})")
+                return
+
         try:
             order = self.host.place_order("BUY", option, qty, mode)
         except Exception as e:
             self._log(f"HERO ZERO BLOCK | reason=order placement failed ({e})")
+            return
+
+        if not order or not order.get("order_id"):
+            self._log(f"HERO ZERO BLOCK | reason=broker returned empty order id (mode={mode})")
             return
 
         pos = {
