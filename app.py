@@ -1506,7 +1506,7 @@ def is_after_time(value, target):
 
 def get_server_url_hints():
     hints = ["http://127.0.0.1:8765"]
-    port = int(config.get("port", 8765))
+    port = int(os.environ.get("PORT") or config.get("port", 8765))
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
             ip = info[4][0]
@@ -4472,7 +4472,7 @@ def main():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=auto_update_loop, daemon=True).start()
     host = config.get("host", "0.0.0.0")
-    port = int(config.get("port", 8765))
+    port = int(os.environ.get("PORT") or config.get("port", 8765))
     server = ThreadingHTTPServer((host, port), Handler)
     gui_log(f"Cloud API server started: http://{host}:{port}")
     server.serve_forever()
