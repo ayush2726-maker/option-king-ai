@@ -1,3 +1,143 @@
+
+# === OKAI RATE LIMIT PATCH V1 START ===
+# Angel One AB1021 / network recovery patch:
+# - caches read-only market-data calls
+# - throttles excessive LTP/candle requests
+# - retries temporary network/rate-limit failures
+# - does NOT cache/order/modify/cancel any trade endpoints
+try:
+    import os as _okai_os
+    import time as _okai_time
+    import json as _okai_json
+    import random as _okai_random
+    import threading as _okai_threading
+
+    def _okai_install_smartapi_rate_patch_v1():
+        if str(_okai_os.getenv("OKAI_RATE_PATCH", "1")).lower() in ("0", "false", "off", "no"):
+            return
+
+        try:
+            try:
+                from SmartApi.smartConnect import SmartConnect as _OKAI_SC
+            except Exception:
+                from SmartApi import SmartConnect as _OKAI_SC
+        except Exception as _e:
+            print(f"{_okai_time.strftime('%H:%M:%S')} | OKAI RATE PATCH pending | SmartConnect import failed: {_e}")
+            return
+
+        if getattr(_OKAI_SC, "_okai_rate_patch_v1", False):
+            return
+
+        _OKAI_SC._okai_rate_patch_v1 = True
+        _lock = _okai_threading.RLock()
+        _last_call = {}
+        _cache = {}
+
+        def _bad_network_or_rate_limit(err_or_text):
+            s = str(err_or_text).lower()
+            keys = (
+                "ab1021",
+                "too many requests",
+                "rate limit",
+                "network is unreachable",
+                "failed to establish",
+                "newconnectionerror",
+                "max retries exceeded",
+                "connection aborted",
+                "connection reset",
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "service unavailable",
+            )
+            return any(k in s for k in keys)
+
+        def _key(args, kwargs):
+            try:
+                return _okai_json.dumps([args, kwargs], sort_keys=True, default=str)
+            except Exception:
+                return str((args, kwargs))
+
+        def _throttle(bucket, min_gap):
+            with _lock:
+                now = _okai_time.monotonic()
+                last = _last_call.get(bucket, 0.0)
+                wait = float(min_gap) - (now - last)
+                if wait > 0:
+                    _okai_time.sleep(wait)
+                _last_call[bucket] = _okai_time.monotonic()
+
+        def _wrap_method(method_name, ttl, min_gap, retries):
+            orig = getattr(_OKAI_SC, method_name, None)
+            if not callable(orig):
+                return
+
+            def patched(self, *args, **kwargs):
+                cache_key = (method_name, _key(args, kwargs))
+                now = _okai_time.time()
+
+                with _lock:
+                    hit = _cache.get(cache_key)
+                    if hit and (now - hit[0]) <= float(ttl):
+                        return hit[1]
+
+                last_exc = None
+
+                for attempt in range(int(retries) + 1):
+                    try:
+                        _throttle(method_name, min_gap)
+                        res = orig(self, *args, **kwargs)
+
+                        if _bad_network_or_rate_limit(res):
+                            raise RuntimeError(f"{method_name} rate/network response: {str(res)[:250]}")
+
+                        with _lock:
+                            _cache[cache_key] = (_okai_time.time(), res)
+                        return res
+
+                    except Exception as e:
+                        last_exc = e
+
+                        with _lock:
+                            stale = _cache.get(cache_key)
+
+                        if stale and _bad_network_or_rate_limit(e):
+                            print(f"{_okai_time.strftime('%H:%M:%S')} | OKAI RATE PATCH stale fallback | {method_name} | {str(e)[:140]}")
+                            return stale[1]
+
+                        if (not _bad_network_or_rate_limit(e)) or attempt >= int(retries):
+                            raise
+
+                        wait = min(10.0, 1.5 + attempt * 2.0 + _okai_random.random())
+                        print(f"{_okai_time.strftime('%H:%M:%S')} | OKAI RATE PATCH retry | {method_name} | attempt={attempt+1} | wait={wait:.1f}s | {str(e)[:140]}")
+                        _okai_time.sleep(wait)
+
+                raise last_exc
+
+            setattr(_OKAI_SC, method_name, patched)
+
+        _wrap_method("ltpData",       ttl=float(_okai_os.getenv("OKAI_LTP_CACHE_SEC", "3")),      min_gap=float(_okai_os.getenv("OKAI_LTP_GAP_SEC", "0.80")), retries=2)
+        _wrap_method("getCandleData", ttl=float(_okai_os.getenv("OKAI_CANDLE_CACHE_SEC", "20")), min_gap=float(_okai_os.getenv("OKAI_CANDLE_GAP_SEC", "1.50")), retries=2)
+        _wrap_method("getMarketData", ttl=float(_okai_os.getenv("OKAI_MARKET_CACHE_SEC", "3")),  min_gap=float(_okai_os.getenv("OKAI_MARKET_GAP_SEC", "1.00")), retries=2)
+        _wrap_method("getOptionGreek",ttl=float(_okai_os.getenv("OKAI_GREEK_CACHE_SEC", "10")),  min_gap=float(_okai_os.getenv("OKAI_GREEK_GAP_SEC", "1.20")), retries=2)
+        _wrap_method("searchScrip",   ttl=float(_okai_os.getenv("OKAI_SEARCH_CACHE_SEC", "3600")),min_gap=float(_okai_os.getenv("OKAI_SEARCH_GAP_SEC", "1.00")), retries=1)
+
+        print(
+            f"{_okai_time.strftime('%H:%M:%S')} | OKAI RATE PATCH V1 active | "
+            f"LTP cache={_okai_os.getenv('OKAI_LTP_CACHE_SEC','3')}s gap={_okai_os.getenv('OKAI_LTP_GAP_SEC','0.80')}s | "
+            f"CANDLE cache={_okai_os.getenv('OKAI_CANDLE_CACHE_SEC','20')}s gap={_okai_os.getenv('OKAI_CANDLE_GAP_SEC','1.50')}s"
+        )
+
+    _okai_install_smartapi_rate_patch_v1()
+
+except Exception as _okai_patch_error:
+    try:
+        import time as _okai_time
+        print(f"{_okai_time.strftime('%H:%M:%S')} | OKAI RATE PATCH install failed | {_okai_patch_error}")
+    except Exception:
+        pass
+# === OKAI RATE LIMIT PATCH V1 END ===
+
 import csv
 import datetime as dt
 import hashlib
@@ -3776,8 +3916,161 @@ def run_mobile_monthly_backtest(payload, mode, start_capital):
     return build_monthly_backtest_report(mode, start_day, end_day, start_capital, running_capital, day_results, skipped)
 
 
+
+# ===== OKAI ACTUAL REPLAY FUNCTION PATCH START =====
+def _okai_replay_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+def run_actual_trade_replay_backtest(payload=None):
+    import csv, os
+    payload = payload or {}
+
+    day = str(payload.get("date") or payload.get("day") or "").strip()
+    if not day:
+        return {
+            "ok": False,
+            "mode": "REPLAY",
+            "error": "date required",
+            "summary": "ACTUAL REPLAY | date required"
+        }
+
+    ymd = day.replace("-", "")
+    if len(ymd) != 8:
+        return {
+            "ok": False,
+            "mode": "REPLAY",
+            "requested_date": day,
+            "error": "invalid date format, use YYYY-MM-DD",
+            "summary": f"ACTUAL REPLAY {day} | invalid date"
+        }
+
+    used_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    path = "/storage/emulated/0/Download/cloud_bot/data/trade_data/closed_trades_" + ymd + ".csv"
+
+    if not os.path.exists(path):
+        return {
+            "ok": False,
+            "mode": "REPLAY",
+            "requested_date": day,
+            "used_date": used_date,
+            "error": f"No closed trade file found for {used_date}",
+            "summary": f"ACTUAL REPLAY {used_date} | file missing"
+        }
+
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    trades = []
+    for r in rows:
+        net = _okai_replay_float(r.get("net_pnl"))
+        gross = _okai_replay_float(r.get("gross_pnl"))
+        charges = _okai_replay_float(r.get("charges") or r.get("total_charges"))
+
+        trades.append({
+            "date": r.get("date") or used_date,
+            "time": r.get("time") or "",
+            "exit_time": r.get("exit_time") or "",
+            "mode": r.get("mode") or "",
+            "trade_id": r.get("trade_id") or "",
+            "trade_type": r.get("type") or r.get("trade_type") or "",
+            "signal": r.get("signal") or "",
+            "symbol": r.get("symbol") or "",
+            "entry": _okai_replay_float(r.get("entry")),
+            "exit": _okai_replay_float(r.get("exit")),
+            "qty": int(_okai_replay_float(r.get("qty"))),
+            "gross_pnl": gross,
+            "charges": charges,
+            "net_pnl": net,
+            "reason": r.get("reason") or "",
+        })
+
+    count = len(trades)
+    wins = sum(1 for t in trades if t["net_pnl"] > 0)
+    losses = sum(1 for t in trades if t["net_pnl"] < 0)
+    gross_pnl = sum(t["gross_pnl"] for t in trades)
+    net_pnl = sum(t["net_pnl"] for t in trades)
+    total_charges = sum(t["charges"] for t in trades)
+    win_rate = (wins / count * 100.0) if count else 0.0
+
+    start_capital = _okai_replay_float(
+        payload.get("capital") or payload.get("start_capital") or 0
+    )
+    final_capital = start_capital + net_pnl if start_capital else net_pnl
+
+    summary = f"ACTUAL TRADE REPLAY {used_date} | Trades {count} | P&L {net_pnl:.2f} | Win Rate {win_rate:.2f}%"
+
+    lines = [
+        f"ACTUAL TRADE REPLAY {used_date}",
+        f"Trades: {count}",
+        f"Wins: {wins}",
+        f"Losses: {losses}",
+        f"Win Rate: {win_rate:.2f}%",
+        f"Gross P&L: {gross_pnl:.2f}",
+        f"Charges: {total_charges:.2f}",
+        f"Net P&L: {net_pnl:.2f}",
+        "",
+        "TRADES"
+    ]
+
+    for t in trades:
+        lines.append(
+            f"{t['time']}->{t['exit_time']} | {t['signal']} | {t['symbol']} | "
+            f"Entry {t['entry']} | Exit {t['exit']} | Qty {t['qty']} | "
+            f"Net {t['net_pnl']:.2f} | {t['reason']}"
+        )
+
+    return {
+        "ok": True,
+        "mode": "REPLAY",
+        "requested_date": day,
+        "used_date": used_date,
+        "summary": summary,
+        "report": "\n".join(lines),
+        "stats": {
+            "capital": start_capital,
+            "start_capital": start_capital,
+            "final_capital": final_capital,
+            "trades": count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 2),
+            "gross_pnl": round(gross_pnl, 2),
+            "charges": round(total_charges, 2),
+            "net_pnl": round(net_pnl, 2),
+            "pnl": round(net_pnl, 2)
+        },
+        "trades": trades,
+        "data": {
+            "mode": "REPLAY",
+            "start_day": used_date,
+            "end_day": used_date,
+            "day_results": [{
+                "day_stats": {
+                    "day": used_date,
+                    "trades": count,
+                    "wins": wins,
+                    "losses": losses,
+                    "pnl": round(net_pnl, 2),
+                    "win_rate": round(win_rate, 2)
+                },
+                "summary": summary
+            }]
+        }
+    }
+# ===== OKAI ACTUAL REPLAY FUNCTION PATCH END =====
+
+
 def run_mobile_backtest(payload=None):
     payload = payload or {}
+    _bt_mode = str(payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "").upper().replace("-", "_").replace(" ", "_")
+    if _bt_mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY"):
+        return run_actual_trade_replay_backtest(payload)
+
     mode = str(payload.get("mode", "FAST") or "FAST").upper()
     start_capital = float(payload.get("capital") or paper_capital or capital)
     if mode in {"MONTH", "MONTHLY"}:
@@ -4364,7 +4657,19 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/scan":
             self.send_json({"ok": True, "data": last_market_scan})
         elif path == "/backtest":
-            self.send_json({"ok": True, "summary": last_backtest_summary, "report": last_backtest_report})
+            _bt_raw_qs = urlparse(self.path).query
+            _bt_mode_get = ""
+            _bt_date_get = ""
+            for _bt_p in _bt_raw_qs.split("&"):
+                if _bt_p.startswith("mode="):
+                    _bt_mode_get = _bt_p[5:].upper()
+                if _bt_p.startswith("date="):
+                    _bt_date_get = _bt_p[5:]
+            if _bt_mode_get in ("REPLAY", "ACTUAL_REPLAY", "ACTUALREPLAY"):
+                _rp_g = run_actual_trade_replay_backtest({"mode": "REPLAY", "date": _bt_date_get})
+                self.send_json(_rp_g)
+            else:
+                self.send_json({"ok": True, "summary": last_backtest_summary, "report": last_backtest_report})
         elif path == "/live":
             self.send_json({"ok": True, "title": "Live Bot", "text": build_live_text()})
         elif path == "/risk":
@@ -4407,8 +4712,13 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run_market_scan, daemon=True).start()
             self.send_json({"ok": True, "message": "scan started"})
         elif path == "/backtest":
-            message = start_mobile_backtest(body)
-            self.send_json({"ok": True, "message": message})
+            _bt_mode_post = str((body or {}).get("mode", "")).upper()
+            if _bt_mode_post in ("REPLAY", "ACTUAL_REPLAY", "ACTUALREPLAY"):
+                _rp_p = run_actual_trade_replay_backtest(body)
+                self.send_json(_rp_p)
+            else:
+                message = start_mobile_backtest(body)
+                self.send_json({"ok": True, "message": message})
         elif path == "/master-cache":
             threading.Thread(target=refresh_master_cache_worker, daemon=True).start()
             self.send_json({"ok": True, "message": "master cache refresh started"})
@@ -23656,5 +23966,760 @@ def hero_zero_tick():
         except Exception: pass
 
 
+
+
+
+
+
+# OKAI_STRATEGY_BACKTEST_DIAGNOSTIC_V1
+_OKAI_BT_DIAG = {}
+
+def _okai_diag_reset():
+    global _OKAI_BT_DIAG
+    _OKAI_BT_DIAG = {
+        "signal_calls": 0,
+        "non_wait_signals": [],
+        "quality_checks": [],
+        "option_checks": [],
+        "errors": [],
+    }
+
+def _okai_safe_short(x, limit=500):
+    try:
+        if isinstance(x, dict):
+            keep = {}
+            for k, v in x.items():
+                lk = str(k).lower()
+                if lk in ("signal","side","score","total_score","quality_score","approved","ok","reason","reject_reason","summary","symbol","entry","premium","required_score","required","status"):
+                    keep[k] = v
+            return keep if keep else str(x)[:limit]
+        return str(x)[:limit]
+    except Exception as e:
+        return "repr_error:" + str(e)
+
+def _okai_diag_add(key, item, limit=25):
+    try:
+        arr = _OKAI_BT_DIAG.setdefault(key, [])
+        if len(arr) < limit:
+            arr.append(_okai_safe_short(item))
+    except Exception:
+        pass
+
+def _okai_install_strategy_diag():
+    g = globals()
+
+    for name in ["backtest_signal", "_okai_backtest_live_core_signal"]:
+        fn = g.get(name)
+        if callable(fn) and not getattr(fn, "_okai_diag_wrapped", False):
+            def make_wrap(orig, fname):
+                def wrap(*args, **kwargs):
+                    try:
+                        _OKAI_BT_DIAG["signal_calls"] = _OKAI_BT_DIAG.get("signal_calls", 0) + 1
+                    except Exception:
+                        pass
+                    try:
+                        res = orig(*args, **kwargs)
+                        txt = str(res).upper()
+                        if ("CE" in txt or "PE" in txt or "BUY" in txt or "SIGNAL" in txt) and "WAIT" not in txt:
+                            _okai_diag_add("non_wait_signals", {"fn": fname, "result": res})
+                        return res
+                    except Exception as e:
+                        _okai_diag_add("errors", {"fn": fname, "error": str(e)})
+                        raise
+                wrap._okai_diag_wrapped = True
+                return wrap
+            g[name] = make_wrap(fn, name)
+
+    for name in ["_okai_build_trade_quality"]:
+        fn = g.get(name)
+        if callable(fn) and not getattr(fn, "_okai_diag_wrapped", False):
+            def make_wrap(orig, fname):
+                def wrap(*args, **kwargs):
+                    try:
+                        res = orig(*args, **kwargs)
+                        _okai_diag_add("quality_checks", {"fn": fname, "result": res})
+                        return res
+                    except Exception as e:
+                        _okai_diag_add("errors", {"fn": fname, "error": str(e)})
+                        raise
+                wrap._okai_diag_wrapped = True
+                return wrap
+            g[name] = make_wrap(fn, name)
+
+    for name in ["choose_realistic_backtest_option"]:
+        fn = g.get(name)
+        if callable(fn) and not getattr(fn, "_okai_diag_wrapped", False):
+            def make_wrap(orig, fname):
+                def wrap(*args, **kwargs):
+                    try:
+                        res = orig(*args, **kwargs)
+                        _okai_diag_add("option_checks", {"fn": fname, "result": res})
+                        return res
+                    except Exception as e:
+                        _okai_diag_add("errors", {"fn": fname, "error": str(e)})
+                        raise
+                wrap._okai_diag_wrapped = True
+                return wrap
+            g[name] = make_wrap(fn, name)
+
+    fn = g.get("run_mobile_backtest")
+    if callable(fn) and not getattr(fn, "_okai_diag_wrapped", False):
+        def run_mobile_backtest_diag(payload=None):
+            _okai_diag_reset()
+            res = fn(payload)
+            try:
+                if isinstance(res, dict):
+                    res["debug"] = _OKAI_BT_DIAG
+                    trades = 0
+                    st = res.get("stats") or {}
+                    if isinstance(st, dict):
+                        trades = int(float(st.get("trades") or st.get("total_trades") or 0))
+                    if trades == 0:
+                        extra = (
+                            "\n\nDEBUG WHY ZERO TRADES"
+                            f"\nSignal calls: {_OKAI_BT_DIAG.get('signal_calls')}"
+                            f"\nNon-wait signals: {_OKAI_BT_DIAG.get('non_wait_signals')[:5]}"
+                            f"\nQuality checks: {_OKAI_BT_DIAG.get('quality_checks')[:5]}"
+                            f"\nOption checks: {_OKAI_BT_DIAG.get('option_checks')[:5]}"
+                            f"\nErrors: {_OKAI_BT_DIAG.get('errors')[:5]}"
+                        )
+                        res["report"] = str(res.get("report") or "") + extra
+                        res["summary"] = str(res.get("summary") or "") + " | DEBUG ADDED"
+            except Exception:
+                pass
+            return res
+        run_mobile_backtest_diag._okai_diag_wrapped = True
+        g["run_mobile_backtest"] = run_mobile_backtest_diag
+
+_okai_install_strategy_diag()
+
+
+
+
+# ===== OKAI_BT_5M_OFFLINE_FALLBACK_V1 =====
+# Backtest me Angel obj/config missing ho to current strategy ko change kiye bina
+# historical 1m candles se 5m candles banakar MTF check chalata hai.
+try:
+    _OKAI_BT_BASE_TQU_GET_5M = _tqu_get_5m_candles
+    _OKAI_BT_BASE_RUN_DAY = run_mobile_backtest_day
+    _OKAI_BT_ACTIVE_DAY = None
+    _OKAI_BT_5M_OFFLINE_CACHE = {}
+
+    def _okai_bt_norm_day(day):
+        try:
+            if hasattr(day, "strftime"):
+                return day.strftime("%Y-%m-%d")
+            txt = str(day or "").strip()
+            if len(txt) == 8 and txt.isdigit():
+                return f"{txt[:4]}-{txt[4:6]}-{txt[6:]}"
+            return txt[:10]
+        except Exception:
+            return str(day or "")[:10]
+
+    def _okai_bt_1m_to_5m(df):
+        try:
+            if df is None:
+                return None
+            if isinstance(df, tuple):
+                df = df[0]
+            if isinstance(df, dict):
+                df = df.get("df") or df.get("data") or df.get("rows") or df.get("candles")
+            work = pd.DataFrame(df).copy()
+            if work.empty:
+                return None
+
+            tcol = None
+            for c in ["time", "datetime", "date", "timestamp"]:
+                if c in work.columns:
+                    tcol = c
+                    break
+            if tcol is None:
+                return None
+
+            for c in ["open", "high", "low", "close"]:
+                if c not in work.columns:
+                    return None
+                work[c] = pd.to_numeric(work[c], errors="coerce")
+
+            if "volume" not in work.columns:
+                work["volume"] = 0
+            work["volume"] = pd.to_numeric(work["volume"], errors="coerce").fillna(0)
+
+            work[tcol] = pd.to_datetime(work[tcol], errors="coerce")
+            work = work.dropna(subset=[tcol, "open", "high", "low", "close"]).sort_values(tcol)
+            if len(work) < 10:
+                return None
+
+            work = work.set_index(tcol)
+            df5 = work.resample("5min", origin="start_day", offset="15min").agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }).dropna().reset_index()
+
+            df5 = df5.rename(columns={tcol: "time"})
+            if len(df5) < 10:
+                return None
+            return df5
+        except Exception as exc:
+            try:
+                gui_log(f"BT 5m fallback build failed: {exc}")
+            except Exception:
+                pass
+            return None
+
+    def _okai_bt_get_offline_5m(day):
+        try:
+            day = _okai_bt_norm_day(day)
+            if not day:
+                return None
+            if day in _OKAI_BT_5M_OFFLINE_CACHE:
+                return _OKAI_BT_5M_OFFLINE_CACHE[day].copy()
+
+            raw = fetch_backtest_candles(day)
+            df5 = _okai_bt_1m_to_5m(raw)
+            if df5 is not None and not df5.empty:
+                _OKAI_BT_5M_OFFLINE_CACHE[day] = df5.copy()
+                try:
+                    gui_log(f"BT 5m fallback active: {day} candles={len(df5)}")
+                except Exception:
+                    pass
+                return df5.copy()
+        except Exception as exc:
+            try:
+                gui_log(f"BT 5m fallback unavailable: {exc}")
+            except Exception:
+                pass
+        return None
+
+    def _tqu_get_5m_candles():
+        day = globals().get("_OKAI_BT_ACTIVE_DAY")
+        if day:
+            df5 = _okai_bt_get_offline_5m(day)
+            if df5 is not None and len(df5) >= 10:
+                return df5
+
+        try:
+            return _OKAI_BT_BASE_TQU_GET_5M()
+        except Exception as exc:
+            try:
+                gui_log(f"5m candle fetch skipped: {exc}")
+            except Exception:
+                pass
+            return None
+
+    def run_mobile_backtest_day(mode, day, start_capital):
+        global _OKAI_BT_ACTIVE_DAY
+        old_day = _OKAI_BT_ACTIVE_DAY
+        _OKAI_BT_ACTIVE_DAY = _okai_bt_norm_day(day)
+        try:
+            return _OKAI_BT_BASE_RUN_DAY(mode, day, start_capital)
+        finally:
+            _OKAI_BT_ACTIVE_DAY = old_day
+
+    try:
+        gui_log("OKAI BT 5m offline fallback V1 active")
+    except Exception:
+        print("OKAI BT 5m offline fallback V1 active")
+
+except Exception as _okai_bt_5m_patch_exc:
+    print("OKAI BT 5m fallback patch failed:", _okai_bt_5m_patch_exc)
+
+# ===== END OKAI_BT_5M_OFFLINE_FALLBACK_V1 =====
+
+
+
+
+# ===== OKAI_BT_5M_ASOF_TIME_FIX_V1 =====
+# Backtest me 5m MTF ko future candle use karne se rokta hai.
+# Current backtest row ke time tak ke 5m candles hi strategy ko milenge.
+try:
+    _OKAI_BT_ASOF_BASE_TQU_GET_5M = _tqu_get_5m_candles
+    _OKAI_BT_ACTIVE_TS = None
+
+    def _okai_bt_pick_ts_from_row(row):
+        try:
+            for k in ("time", "datetime", "date", "timestamp", "ts"):
+                if hasattr(row, "get"):
+                    v = row.get(k)
+                    if v not in (None, ""):
+                        return v
+            return None
+        except Exception:
+            return None
+
+    def _okai_bt_set_active_ts_from_df(df, index):
+        try:
+            row = None
+            try:
+                row = df.iloc[int(index)]
+            except Exception:
+                try:
+                    row = df.loc[index]
+                except Exception:
+                    row = None
+
+            ts = _okai_bt_pick_ts_from_row(row)
+            if ts is None:
+                try:
+                    idxv = df.index[int(index)]
+                    ts = idxv
+                except Exception:
+                    pass
+            globals()["_OKAI_BT_ACTIVE_TS"] = ts
+        except Exception:
+            globals()["_OKAI_BT_ACTIVE_TS"] = None
+
+    def _okai_bt_slice_5m_asof(df5):
+        try:
+            active_ts = globals().get("_OKAI_BT_ACTIVE_TS")
+            if active_ts in (None, ""):
+                return df5
+            if df5 is None:
+                return None
+
+            work = df5.copy()
+            if work.empty:
+                return work
+
+            tcol = None
+            for c in ("time", "datetime", "date", "timestamp"):
+                if c in work.columns:
+                    tcol = c
+                    break
+            if tcol is None:
+                return work
+
+            active_dt = pd.to_datetime(active_ts, errors="coerce")
+            if pd.isna(active_dt):
+                return work
+
+            t = pd.to_datetime(work[tcol], errors="coerce")
+            sliced = work.loc[t <= active_dt].copy()
+
+            if len(sliced) >= 10:
+                return sliced
+
+            # Early market me 10 candles se kam ho to MTF check naturally skip hoga
+            return sliced
+        except Exception as exc:
+            try:
+                gui_log(f"BT 5m asof slice failed: {exc}")
+            except Exception:
+                pass
+            return df5
+
+    def _tqu_get_5m_candles():
+        df5 = _OKAI_BT_ASOF_BASE_TQU_GET_5M()
+        return _okai_bt_slice_5m_asof(df5)
+
+    if "backtest_signal" in globals():
+        _OKAI_BT_ASOF_BASE_BACKTEST_SIGNAL = backtest_signal
+        def backtest_signal(df, index, *args, **kwargs):
+            old_ts = globals().get("_OKAI_BT_ACTIVE_TS")
+            _okai_bt_set_active_ts_from_df(df, index)
+            try:
+                return _OKAI_BT_ASOF_BASE_BACKTEST_SIGNAL(df, index, *args, **kwargs)
+            finally:
+                globals()["_OKAI_BT_ACTIVE_TS"] = old_ts
+
+    if "_okai_backtest_live_score_signal" in globals():
+        _OKAI_BT_ASOF_BASE_LIVE_SCORE_SIGNAL = _okai_backtest_live_score_signal
+        def _okai_backtest_live_score_signal(df, index, *args, **kwargs):
+            old_ts = globals().get("_OKAI_BT_ACTIVE_TS")
+            _okai_bt_set_active_ts_from_df(df, index)
+            try:
+                return _OKAI_BT_ASOF_BASE_LIVE_SCORE_SIGNAL(df, index, *args, **kwargs)
+            finally:
+                globals()["_OKAI_BT_ACTIVE_TS"] = old_ts
+
+    try:
+        gui_log("OKAI BT 5m ASOF time fix V1 active")
+    except Exception:
+        print("OKAI BT 5m ASOF time fix V1 active")
+
+except Exception as _okai_bt_asof_exc:
+    print("OKAI BT 5m ASOF patch failed:", _okai_bt_asof_exc)
+
+# ===== END OKAI_BT_5M_ASOF_TIME_FIX_V1 =====
+
+
+
+
+# ===== OKAI_BT_VOL_CORE_FILL_V1 =====
+# Strategy thresholds same rahenge.
+# Sirf backtest me setup ke missing volume_ratio/core_score ko historical candle se fill karta hai.
+try:
+    _OKAI_BT_VOL_CORE_BASE_COMPUTE = compute_weighted_setup
+
+    def _okai_bt_is_active():
+        try:
+            if globals().get("_OKAI_BT_ACTIVE_DAY") or globals().get("_OKAI_BT_ACTIVE_TS"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _okai_bt_col(work, name):
+        try:
+            lowmap = {str(c).lower(): c for c in work.columns}
+            return lowmap.get(name.lower())
+        except Exception:
+            return None
+
+    def _okai_bt_float(x, default=0.0):
+        try:
+            if x in (None, "", "nan", "NaN"):
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _okai_bt_calc_volume_ratio(work):
+        try:
+            vc = _okai_bt_col(work, "volume")
+            if vc is None or len(work) < 6:
+                return None, None, None
+
+            v = pd.to_numeric(work[vc], errors="coerce").fillna(0)
+            cur = float(v.iloc[-1] or 0)
+            prev = v.iloc[-21:-1] if len(v) >= 21 else v.iloc[:-1]
+            prev = prev[prev > 0]
+
+            if cur <= 0 or prev.empty:
+                return None, None, None
+
+            avg = float(prev.mean() or 0)
+            if avg <= 0:
+                return None, None, None
+
+            return cur, avg, cur / avg
+        except Exception:
+            return None, None, None
+
+    def _okai_bt_calc_vwap(work):
+        try:
+            hc = _okai_bt_col(work, "high")
+            lc = _okai_bt_col(work, "low")
+            cc = _okai_bt_col(work, "close")
+            vc = _okai_bt_col(work, "volume")
+            if not (hc and lc and cc and vc):
+                return None
+
+            high = pd.to_numeric(work[hc], errors="coerce")
+            low = pd.to_numeric(work[lc], errors="coerce")
+            close = pd.to_numeric(work[cc], errors="coerce")
+            vol = pd.to_numeric(work[vc], errors="coerce").fillna(0)
+
+            tp = (high + low + close) / 3.0
+            denom = vol.cumsum().replace(0, pd.NA)
+            vwap = (tp * vol).cumsum() / denom
+            val = vwap.dropna().iloc[-1] if not vwap.dropna().empty else None
+            return _okai_bt_float(val, None)
+        except Exception:
+            return None
+
+    def _okai_bt_calc_core(signal, setup, work, price):
+        try:
+            sig = str(signal or "").upper()
+            cc = _okai_bt_col(work, "close")
+            if cc is None or len(work) < 21:
+                return None
+
+            close = pd.to_numeric(work[cc], errors="coerce").dropna()
+            if len(close) < 21:
+                return None
+
+            ema9 = _okai_bt_float(setup.get("ema9"), None)
+            ema21 = _okai_bt_float(setup.get("ema21"), None)
+
+            if ema9 is None or ema9 <= 0:
+                ema9 = float(close.ewm(span=9, adjust=False).mean().iloc[-1])
+                setup["ema9"] = ema9
+
+            if ema21 is None or ema21 <= 0:
+                ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
+                setup["ema21"] = ema21
+
+            vwap = _okai_bt_float(setup.get("vwap"), None)
+            if vwap is None or vwap <= 0:
+                vwap = _okai_bt_calc_vwap(work)
+                if vwap:
+                    setup["vwap"] = vwap
+
+            px = _okai_bt_float(price, 0)
+            if px <= 0:
+                px = float(close.iloc[-1])
+
+            adx = _okai_bt_float(setup.get("adx14", setup.get("adx")), 0)
+            vol_ratio = _okai_bt_float(setup.get("volume_ratio"), 0)
+
+            st_raw = str(
+                setup.get("supertrend_dir")
+                or setup.get("supertrend")
+                or setup.get("st_dir")
+                or setup.get("trend")
+                or ""
+            ).upper()
+
+            core = 0
+
+            if sig == "CE":
+                if ema9 > ema21:
+                    core += 1
+                if vwap and px > vwap:
+                    core += 1
+                if st_raw in ("UP", "BULLISH", "BUY", "GREEN", "1"):
+                    core += 1
+                if adx >= _tqu_adx_min_trade():
+                    core += 1
+                if vol_ratio >= _okai_config_float("tqu_sideways_min_vol_ratio", 1.2, 0.8, 3.0):
+                    core += 1
+
+            elif sig == "PE":
+                if ema9 < ema21:
+                    core += 1
+                if vwap and px < vwap:
+                    core += 1
+                if st_raw in ("DOWN", "BEARISH", "SELL", "RED", "-1"):
+                    core += 1
+                if adx >= _tqu_adx_min_trade():
+                    core += 1
+                if vol_ratio >= _okai_config_float("tqu_sideways_min_vol_ratio", 1.2, 0.8, 3.0):
+                    core += 1
+
+            return core
+        except Exception:
+            return None
+
+    def compute_weighted_setup(signal, df, price):
+        setup = _OKAI_BT_VOL_CORE_BASE_COMPUTE(signal, df, price)
+
+        try:
+            if not _okai_bt_is_active():
+                return setup
+            if not isinstance(setup, dict) or df is None:
+                return setup
+
+            work = pd.DataFrame(df).copy()
+            if work.empty:
+                return setup
+
+            cur, avg, ratio = _okai_bt_calc_volume_ratio(work)
+            if ratio is not None:
+                old_ratio = _okai_bt_float(setup.get("volume_ratio"), 0)
+                if old_ratio <= 1.01:
+                    setup["volume"] = cur
+                    setup["avg_volume"] = avg
+                    setup["volume_ratio"] = ratio
+                    setup["volume_spike"] = {
+                        "score": 8 if ratio >= 1.2 else 6 if ratio >= 1.1 else 0,
+                        "ratio": ratio,
+                    }
+
+            old_core = _okai_bt_float(setup.get("core_score"), 0)
+            if old_core <= 0:
+                core = _okai_bt_calc_core(signal, setup, work, price)
+                if core is not None:
+                    setup["core_score"] = core
+
+            try:
+                if _okai_bt_float(setup.get("volume_ratio"), 1) >= 1.1 or _okai_bt_float(setup.get("core_score"), 0) > 0:
+                    gui_log(
+                        f"BT VOL/CORE FILL | {signal} | "
+                        f"vol={_okai_bt_float(setup.get('volume_ratio'), 1):.2f}x | "
+                        f"core={_okai_bt_float(setup.get('core_score'), 0):.0f}/5 | "
+                        f"score={_okai_bt_float(setup.get('score'), 0):.0f}"
+                    )
+            except Exception:
+                pass
+
+        except Exception as exc:
+            try:
+                gui_log(f"BT VOL/CORE fill skipped: {exc}")
+            except Exception:
+                pass
+
+        return setup
+
+    try:
+        gui_log("OKAI BT VOL/CORE fill V1 active")
+    except Exception:
+        print("OKAI BT VOL/CORE fill V1 active")
+
+except Exception as _okai_bt_vol_core_exc:
+    print("OKAI BT VOL/CORE fill patch failed:", _okai_bt_vol_core_exc)
+
+# ===== END OKAI_BT_VOL_CORE_FILL_V1 =====
+
+
 if __name__ == "__main__":
     main()
+
+# ===== OPTION KING AI PATCH: FULL CAPITAL + WIDE TRAIL + REENTRY =====
+# Version: 2026.06.29-fullcap-widetail-reentry-1
+# Changes:
+#   1. max_risk_per_trade_percent hard cap 1.5% -> 15% (full capital use)
+#   2. apply_live_strategy_runtime_settings default 1.0% -> 8.0%
+#   3. trail_peak_gap_percent default 5% -> 20% (wider trail)
+#   4. risk_trail_sl removed from trail calculation (peak trail only)
+#   5. reentry_block_minutes default 5 -> 2 (faster re-entry)
+#   6. post_exit_wait_minutes -> 1 min only
+
+# --- 1. Risk cap override ---
+_OKAI_FULLCAP_BASE_MAX_RISK = max_risk_per_trade_percent
+
+def max_risk_per_trade_percent():
+    try:
+        val = _okai_fix_float(config.get("max_risk_per_trade_percent", 8.0), 8.0)
+        return min(15.0, max(1.0, val))
+    except Exception:
+        return 8.0
+
+# --- 2. Runtime settings default fix ---
+_OKAI_FULLCAP_BASE_APPLY_RUNTIME = apply_live_strategy_runtime_settings
+
+def apply_live_strategy_runtime_settings():
+    try:
+        _OKAI_FULLCAP_BASE_APPLY_RUNTIME()
+    except Exception as exc:
+        _okai_fix_log(f"[FULLCAP] runtime base skipped: {str(exc)[:80]}")
+    # Override conservative defaults
+    if config.get("max_risk_per_trade_percent", 0) < 5.0:
+        config["max_risk_per_trade_percent"] = 8.0
+        save_cloud_config()
+        _okai_fix_log("[FULLCAP] max_risk_per_trade_percent set to 8.0%")
+
+# --- 3 & 4. Wide trail SL override ---
+_OKAI_FULLCAP_BASE_PEAK_GAP = _okai_peak_trail_gap_percent
+
+def _okai_peak_trail_gap_percent():
+    try:
+        val = _okai_config_float("trail_peak_gap_percent", 20.0, 5.0, 40.0)
+        return val
+    except Exception:
+        return 20.0
+
+_OKAI_FULLCAP_BASE_UPDATE_TRAIL = update_trailing_sl
+
+def update_trailing_sl(*args, **kwargs):
+    """Wide peak-only trail SL — risk_trail_sl removed to avoid early exit."""
+    global position
+    if position is None:
+        return
+
+    entry = _okai_float(position.get("entry"))
+    ltp = _okai_float(position.get("ltp", entry))
+    old_sl = _okai_float(position.get("sl"))
+    qty = _okai_int(position.get("qty"))
+
+    if entry <= 0 or ltp <= 0 or qty <= 0:
+        return
+
+    # Track peak
+    old_peak = _okai_float(position.get("peak", entry), entry)
+    if ltp > old_peak:
+        position["peak"] = ltp
+    peak = max(_okai_float(position.get("peak", entry), entry), entry, ltp)
+
+    if "initial_risk" not in position:
+        position["initial_risk"] = abs(entry - old_sl) if old_sl > 0 else entry * (_okai_float(globals().get("SL_PERCENT", 20)) / 100)
+    initial_risk = max(_okai_float(position.get("initial_risk")), entry * 0.01)
+
+    # Cost lock — protect charges
+    try:
+        cost_lock, charges, buffer_amount = okai_charge_adjusted_cost_lock(entry, ltp, qty)
+        if ltp >= cost_lock and _okai_float(position.get("sl")) < cost_lock:
+            old = _okai_float(position.get("sl"))
+            position["sl"] = cost_lock
+            gui_log(f"[FULLCAP] Cost lock SL {old:.2f}->{cost_lock:.2f}")
+    except Exception:
+        cost_lock = entry
+
+    profit = ltp - entry
+    if profit >= initial_risk:
+        gap_percent = _okai_peak_trail_gap_percent()
+        # ONLY peak trail — no risk_trail_sl to avoid early exit
+        peak_trail_sl = peak * (1 - gap_percent / 100)
+        trail_sl = max(_okai_float(position.get("sl")), cost_lock, peak_trail_sl)
+        if trail_sl > _okai_float(position.get("sl")):
+            old = _okai_float(position.get("sl"))
+            position["sl"] = trail_sl
+            gui_log(
+                f"[FULLCAP] Peak trail SL | Peak {peak:.2f} | Gap {gap_percent:.1f}% | "
+                f"SL {old:.2f}->{trail_sl:.2f}"
+            )
+
+# --- 5. Faster re-entry ---
+_OKAI_FULLCAP_BASE_REENTRY_MINUTES = reentry_block_minutes
+
+def reentry_block_minutes():
+    try:
+        val = float(config.get("reentry_block_minutes", 2.0))
+        return max(1.0, min(val, 10.0))
+    except Exception:
+        return 2.0
+
+_OKAI_FULLCAP_BASE_POST_EXIT = post_exit_wait_minutes
+
+def post_exit_wait_minutes():
+    try:
+        val = float(config.get("post_exit_wait_minutes", 1.0))
+        return max(0.0, min(val, 5.0))
+    except Exception:
+        return 1.0
+
+_okai_fix_log("[FULLCAP PATCH v2026.06.29] Loaded: full capital + wide trail 20% + fast reentry")
+
+
+
+# ===== OPTION KING AI PATCH: 90% CAPITAL UTILIZATION =====
+# Version: 2026.06.29-capital90-1
+
+_OKAI_CAP90_BASE_GET_QTY = get_qty
+
+def get_qty(premium, trade_type, lot_size):
+    try:
+        premium = _okai_fix_float(premium, 0.0)
+        lot_size = max(1, _okai_fix_int(lot_size, _okai_fix_default_lot_size()))
+        if premium <= 0 or lot_size <= 0:
+            return _OKAI_CAP90_BASE_GET_QTY(premium, trade_type, lot_size)
+        base_capital = _okai_fix_effective_capital_base()
+        usable_capital = base_capital * 0.90
+        max_lots = int(usable_capital // (premium * lot_size))
+        if max_lots <= 0:
+            return _OKAI_CAP90_BASE_GET_QTY(premium, trade_type, lot_size)
+        used_lots = qty_lots_for_trade_type(max_lots, trade_type)
+        qty = used_lots * lot_size
+        _okai_fix_log(f"[CAP90] Capital {base_capital:.0f} | 90%={usable_capital:.0f} | Premium {premium:.2f} | Lots {used_lots} | Qty {qty}")
+        return qty
+    except Exception as exc:
+        _okai_fix_log(f"[CAP90] fallback: {exc}")
+        return _OKAI_CAP90_BASE_GET_QTY(premium, trade_type, lot_size)
+
+_okai_fix_log("[CAP90 PATCH v2026.06.29] Loaded: 90% capital utilization")
+
+
+# ===== OPTION KING AI PATCH: TRADE LIMITS RELAXED =====
+# Version: 2026.06.29-tradelimits-1
+# safe_max_trades_per_day: 3 -> 10
+# safe_max_consecutive_losses: 2 -> 4
+# safe_daily_max_loss_percent: 3% -> 8%
+
+_OKAI_LIMITS_BASE_SAFETY_BLOCK = safety_trade_limits_block_reason
+
+def safety_trade_limits_block_reason():
+    try:
+        if "safe_max_trades_per_day" not in config or int(config.get("safe_max_trades_per_day", 0)) < 10:
+            config["safe_max_trades_per_day"] = 10
+        if "safe_max_consecutive_losses" not in config or int(config.get("safe_max_consecutive_losses", 0)) < 4:
+            config["safe_max_consecutive_losses"] = 4
+        if "safe_daily_max_loss_percent" not in config or float(config.get("safe_daily_max_loss_percent", 0)) < 8.0:
+            config["safe_daily_max_loss_percent"] = 8.0
+    except Exception:
+        pass
+    return _OKAI_LIMITS_BASE_SAFETY_BLOCK()
+
+_okai_fix_log("[LIMITS PATCH v2026.06.29] Loaded: max_trades=10 | max_losses=4 | daily_loss=8%")
