@@ -24804,3 +24804,289 @@ def _tqu_mtf_enabled():
 
 _okai_fix_log("[NOMTF PATCH v2026.07.04] Loaded: 5m MTF check disabled, reverted to pre-MTF entry logic")
 # ===== END NOMTF PATCH =====
+
+# ===== OPTION KING AI PATCH: PAPER CAPITAL ISOLATION FINAL =====
+# Version: 2026.07.04-paper-capital-isolation-final
+# PAPER mode me broker/RMS/live balance/capital use nahi hoga.
+# PAPER mode = configured paper_capital + paper daily_pnl only.
+
+def _okai_iso_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def okai_current_mode():
+    try:
+        return str(
+            config.get("trading_mode")
+            or config.get("trade_mode")
+            or config.get("mode")
+            or "PAPER"
+        ).strip().upper()
+    except Exception:
+        return "PAPER"
+
+
+def is_live_mode(mode=None):
+    text = str(mode or okai_current_mode()).strip().upper()
+    return text in {"LIVE", "REAL", "REAL_TRADE", "REALISTIC_LIVE"}
+
+
+def okai_paper_start_capital():
+    # IMPORTANT: config["capital"] ko source mat banao, kyunki wahi old/live value confuse kar sakti hai.
+    return _okai_iso_float(
+        config.get("paper_capital")
+        or os.getenv("OKAI_PAPER_CAPITAL")
+        or 100000,
+        100000
+    )
+
+
+def get_effective_capital(mode=None, settings=None, broker=None):
+    """
+    Central capital source.
+    PAPER/BACKTEST/DEMO: paper_capital + paper daily_pnl
+    LIVE: current code me broker balance fetch nahi karte; live order engine alag guard se chalega.
+    """
+    if is_live_mode(mode):
+        return _okai_iso_float(capital, okai_paper_start_capital()), "LIVE_MODE_LOCAL_CAPITAL"
+
+    start = okai_paper_start_capital()
+    pnl = _okai_iso_float(globals().get("daily_pnl", 0), 0)
+    return max(0.0, start + pnl), "PAPER_CAPITAL"
+
+
+def okai_apply_paper_capital_guard(reason=""):
+    global capital, paper_capital
+    if is_live_mode():
+        return
+
+    start = okai_paper_start_capital()
+    pnl = _okai_iso_float(globals().get("daily_pnl", 0), 0)
+
+    paper_capital = start
+    capital = max(0.0, start + pnl)
+
+    try:
+        config["paper_capital"] = paper_capital
+        config["mode"] = "PAPER"
+        config["trading_mode"] = "PAPER"
+    except Exception:
+        pass
+
+    try:
+        gui_log(f"[PAPER-ISO] MODE=PAPER | capital_source=PAPER_CAPITAL | start={paper_capital:.2f} | capital={capital:.2f} | {reason}")
+    except Exception:
+        pass
+
+
+# load_config ke baad paper capital enforce
+try:
+    _OKAI_ISO_BASE_LOAD_CONFIG = load_config
+
+    def load_config():
+        res = _OKAI_ISO_BASE_LOAD_CONFIG()
+        okai_apply_paper_capital_guard("load_config")
+        return res
+except Exception:
+    pass
+
+
+# update_capital ko proper paper capital update banao
+try:
+    _OKAI_ISO_BASE_SAVE_CLOUD_CONFIG = save_cloud_config
+except Exception:
+    _OKAI_ISO_BASE_SAVE_CLOUD_CONFIG = None
+
+def update_capital(new_capital):
+    global capital, paper_capital, daily_pnl, trades_taken
+    global daily_target_alert_done, daily_profit_floor, daily_profit_lock_level
+
+    paper_capital = max(0.0, _okai_iso_float(new_capital, 100000))
+    capital = paper_capital
+    daily_pnl = 0.0
+    trades_taken = 0
+    daily_target_alert_done = False
+    daily_profit_floor = None
+    daily_profit_lock_level = 0.0
+
+    config["paper_capital"] = paper_capital
+    config["capital"] = paper_capital   # backward compatibility only
+    config["mode"] = "PAPER"
+    config["trading_mode"] = "PAPER"
+
+    try:
+        save_cloud_config()
+    except Exception:
+        pass
+
+    try:
+        save_capital_state("manual_paper_capital_update")
+    except Exception:
+        pass
+
+    gui_log(f"[PAPER-ISO] Paper capital updated: {paper_capital:.2f}")
+    send_msg(f"Option King AI: Paper capital updated to {paper_capital:.2f}")
+
+
+# saved capital_state me bhi paper source hi save karo
+try:
+    _OKAI_ISO_BASE_SAVE_CAPITAL_STATE = save_capital_state
+
+    def save_capital_state(reason=""):
+        okai_apply_paper_capital_guard(f"save_capital_state:{reason}")
+        try:
+            ensure_dirs()
+            payload = {
+                "capital": float(capital),
+                "paper_capital": float(paper_capital),
+                "daily_pnl": float(daily_pnl),
+                "trades_taken": int(trades_taken),
+                "market_day": market_day_text(),
+                "updated_at": market_now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "capital_source": "PAPER_CAPITAL" if not is_live_mode() else "LIVE_MODE_LOCAL_CAPITAL",
+            }
+            tmp_path = CAPITAL_STATE_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as file:
+                json.dump(payload, file, indent=2)
+            os.replace(tmp_path, CAPITAL_STATE_PATH)
+            return payload
+        except Exception as exc:
+            gui_log(f"[PAPER-ISO] Capital state save skipped: {exc}")
+            return None
+except Exception:
+    pass
+
+
+# trade history load ke baad old/live capital ko paper me clamp karo
+try:
+    _OKAI_ISO_BASE_LOAD_TRADE_HISTORY = load_trade_history_from_disk
+
+    def load_trade_history_from_disk():
+        res = _OKAI_ISO_BASE_LOAD_TRADE_HISTORY()
+        okai_apply_paper_capital_guard("load_trade_history_from_disk")
+        return res
+except Exception:
+    pass
+
+
+# affordable qty paper capital se hi calculate ho
+try:
+    _OKAI_ISO_BASE_GET_MAX_AFFORDABLE_QTY = get_max_affordable_qty
+
+    def get_max_affordable_qty(premium, lot_size):
+        premium = _okai_iso_float(premium, 0)
+        lot_size = int(_okai_iso_float(lot_size, FAST_LOT_SIZE))
+        if premium <= 0 or lot_size <= 0:
+            return 0, 0
+        cap, source = get_effective_capital()
+        max_lots = int(cap // (premium * lot_size))
+        return max_lots * lot_size, max_lots
+except Exception:
+    pass
+
+
+# final get_qty guard: agar purane wrappers high capital se qty de bhi dein, yahan paper cap se clamp ho jayega
+try:
+    _OKAI_ISO_BASE_GET_QTY = get_qty
+
+    def get_qty(premium, trade_type, lot_size):
+        qty = int(_OKAI_ISO_BASE_GET_QTY(premium, trade_type, lot_size) or 0)
+        premium = _okai_iso_float(premium, 0)
+        lot_size = int(_okai_iso_float(lot_size, FAST_LOT_SIZE))
+        if qty <= 0 or premium <= 0 or lot_size <= 0:
+            return 0
+
+        cap, source = get_effective_capital()
+        usable_cap = cap * 0.90
+        max_lots = int(usable_cap // (premium * lot_size))
+        max_qty = max_lots * lot_size
+        final_qty = min(qty, max_qty)
+
+        if final_qty < qty:
+            gui_log(f"[PAPER-ISO] Qty clamped by {source} | requested={qty} | final={final_qty} | cap={cap:.2f}")
+
+        return max(0, final_qty)
+except Exception:
+    pass
+
+
+# option selection ke time temporary capital paper cap par set karo
+try:
+    _OKAI_ISO_BASE_GET_BEST_OPTION = get_best_affordable_option
+
+    def get_best_affordable_option(signal, spot_price):
+        global capital
+        old_capital = capital
+        cap, source = get_effective_capital()
+        if not is_live_mode():
+            capital = cap
+        try:
+            option = _OKAI_ISO_BASE_GET_BEST_OPTION(signal, spot_price)
+            return option
+        finally:
+            if not is_live_mode():
+                capital = cap
+except Exception:
+    pass
+
+
+# live_equity naam app me rahega, par paper mode me ye paper equity hoga
+try:
+    _OKAI_ISO_BASE_GET_LIVE_EQUITY = get_live_equity
+
+    def get_live_equity():
+        if not is_live_mode():
+            if position is None:
+                cap, source = get_effective_capital()
+                return cap
+            try:
+                ltp = position.get("ltp", position.get("entry", 0))
+                gross_pnl = (ltp - position["entry"]) * position["qty"]
+                charges = position_exit_charges(ltp, position["qty"])
+                cap, source = get_effective_capital()
+                return cap + gross_pnl - charges["total"]
+            except Exception:
+                cap, source = get_effective_capital()
+                return cap
+        return _OKAI_ISO_BASE_GET_LIVE_EQUITY()
+except Exception:
+    pass
+
+
+# status me capital source clearly dikhe
+try:
+    _OKAI_ISO_BASE_STATUS_PAYLOAD = status_payload
+
+    def status_payload():
+        okai_apply_paper_capital_guard("status_payload")
+        data = _OKAI_ISO_BASE_STATUS_PAYLOAD()
+        cap, source = get_effective_capital()
+        data["mode"] = okai_current_mode()
+        data["capital"] = cap
+        data["paper_capital"] = paper_capital
+        data["capital_source"] = source
+        data["broker_balance_fetch"] = bool(is_live_mode())
+        data["real_order_allowed"] = bool(is_live_mode())
+        return data
+except Exception:
+    pass
+
+
+# startup par guard apply
+try:
+    okai_apply_paper_capital_guard("patch_loaded")
+except Exception:
+    pass
+
+try:
+    _okai_fix_log("[PAPER-ISO FINAL v2026.07.04] Loaded: PAPER mode uses paper_capital only, no broker/RMS/live capital")
+except Exception:
+    gui_log("[PAPER-ISO FINAL v2026.07.04] Loaded")
+
+# ===== END PAPER CAPITAL ISOLATION FINAL =====
