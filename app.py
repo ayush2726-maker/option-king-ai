@@ -24578,6 +24578,104 @@ except Exception as _okai_bt_vol_core_exc:
 # ===== END OKAI_BT_VOL_CORE_FILL_V1 =====
 
 
+
+
+# ===== OPTION KING AI PATCH: BACKTEST 90% CAPITAL QTY ACTIVE BEFORE MAIN =====
+# Version: 2026.07.04-bt-cap90-before-main
+# IMPORTANT: ye patch main() se pehle load hota hai, isliye app backtest me active rahega.
+
+def _okai_btcap_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def okai_backtest_capital_use_percent():
+    try:
+        val = float(config.get("backtest_capital_use_percent", 90.0))
+    except Exception:
+        val = 90.0
+    return max(1.0, min(val, 100.0))
+
+
+def okai_backtest_use_risk_cap():
+    val = str(config.get("backtest_use_risk_cap", "false")).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+try:
+    _OKAI_BT_CAP90_MAIN_BASE_QTY = backtest_qty
+
+    def backtest_qty(bt_capital, premium, trade_type, lot_size):
+        premium = _okai_btcap_float(premium, 0)
+        lot_size = int(_okai_btcap_float(lot_size, FAST_LOT_SIZE))
+        bt_capital = _okai_btcap_float(bt_capital, 0)
+
+        if premium <= 0 or lot_size <= 0 or bt_capital <= 0:
+            return 0, 0
+
+        usable_capital = bt_capital * (okai_backtest_capital_use_percent() / 100.0)
+        max_lots = int(usable_capital // (premium * lot_size))
+
+        if max_lots <= 0:
+            return 0, 0
+
+        used_lots = qty_lots_for_trade_type(max_lots, trade_type)
+        qty = used_lots * lot_size
+
+        try:
+            gui_log(
+                f"[BT-CAP90-ACTIVE] Capital {bt_capital:.0f} | Use {okai_backtest_capital_use_percent():.0f}% "
+                f"| Premium {premium:.2f} | Max lots {max_lots} | Used lots {used_lots} | Qty {qty}"
+            )
+        except Exception:
+            pass
+
+        return qty, max_lots
+except Exception as _bt_cap90_e:
+    try:
+        gui_log(f"[BT-CAP90-ACTIVE] qty patch failed: {_bt_cap90_e}")
+    except Exception:
+        pass
+
+
+try:
+    _OKAI_BT_CAP90_MAIN_BASE_RISK = backtest_risk_cap_qty
+
+    def backtest_risk_cap_qty(bt_capital, qty, premium, lot_size, sl_percent):
+        qty = int(qty or 0)
+        if qty <= 0:
+            return 0
+
+        if not okai_backtest_use_risk_cap():
+            return qty
+
+        return _OKAI_BT_CAP90_MAIN_BASE_RISK(bt_capital, qty, premium, lot_size, sl_percent)
+except Exception as _bt_risk_e:
+    try:
+        gui_log(f"[BT-CAP90-ACTIVE] risk patch failed: {_bt_risk_e}")
+    except Exception:
+        pass
+
+
+try:
+    config["backtest_capital_use_percent"] = float(config.get("backtest_capital_use_percent", 90.0))
+    config["backtest_use_risk_cap"] = str(config.get("backtest_use_risk_cap", "false")).lower()
+    save_cloud_config()
+except Exception:
+    pass
+
+try:
+    gui_log("[BT-CAP90-ACTIVE v2026.07.04] Loaded before main: backtest uses 90% capital")
+except Exception:
+    print("[BT-CAP90-ACTIVE v2026.07.04] Loaded before main")
+
+# ===== END BACKTEST 90% CAPITAL QTY ACTIVE BEFORE MAIN =====
+
+
 if __name__ == "__main__":
     main()
 
