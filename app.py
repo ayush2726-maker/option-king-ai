@@ -24753,6 +24753,117 @@ except Exception:
 # ===== END BACKTEST ANGEL LOGIN BEFORE MAIN =====
 
 
+
+
+# ===== OPTION KING AI PATCH: AUTO RESTORE ANGEL CONFIG BEFORE BACKTEST =====
+# Version: 2026.07.05-auto-restore-angel-config
+# Agar current config.json me Angel keys missing ho, to users/owner/config.json backup se restore karega.
+
+def okai_auto_restore_angel_config():
+    global config
+    try:
+        import json
+        from pathlib import Path
+
+        need = ["api_key", "client_id", "password", "totp_secret"]
+
+        if not config:
+            try:
+                load_config()
+            except Exception:
+                pass
+
+        missing = [k for k in need if not config.get(k)]
+        if not missing:
+            return True, "Angel config already set"
+
+        candidates = [
+            Path("users/owner/config.json"),
+            Path("users/owner/config_backup.json"),
+            Path("users/owner/config_before_tqu_fix.json"),
+            Path("users/owner/config_before_capital_fix.json"),
+        ]
+
+        for src in candidates:
+            if not src.exists():
+                continue
+
+            try:
+                src_cfg = json.loads(src.read_text() or "{}")
+            except Exception:
+                continue
+
+            if all(src_cfg.get(k) for k in need):
+                for k in need:
+                    config[k] = src_cfg[k]
+
+                # safe runtime settings preserve
+                config["mode"] = "PAPER"
+                config["trading_mode"] = "PAPER"
+                config["paper_capital"] = float(config.get("paper_capital") or config.get("capital") or 100000)
+                config["capital"] = float(config.get("paper_capital") or 100000)
+
+                try:
+                    save_cloud_config()
+                except Exception:
+                    try:
+                        Path("config.json").write_text(json.dumps(config, indent=2))
+                    except Exception:
+                        pass
+
+                try:
+                    gui_log(f"[BT-CONFIG] Angel config restored from {src}")
+                except Exception:
+                    pass
+
+                return True, f"Restored from {src}"
+
+        return False, "Angel config backup not found"
+
+    except Exception as exc:
+        return False, f"Angel config restore error: {exc}"
+
+
+try:
+    _OKAI_AUTO_RESTORE_BASE_ENSURE_ANGEL = okai_ensure_angel_for_backtest
+
+    def okai_ensure_angel_for_backtest():
+        global obj
+
+        ok, msg = okai_auto_restore_angel_config()
+        if not ok:
+            raise RuntimeError("Missing config: api_key, client_id, password, totp_secret | " + msg)
+
+        missing = [k for k in ["api_key", "client_id", "password", "totp_secret"] if not config.get(k)]
+        if missing:
+            raise RuntimeError("Missing config: " + ", ".join(missing))
+
+        if obj is None:
+            angel_login()
+
+        if obj is None:
+            raise RuntimeError("Angel login failed: obj is None")
+
+        if not hasattr(obj, "getCandleData"):
+            raise RuntimeError("Angel login failed: getCandleData unavailable")
+
+        return obj
+
+except Exception as e:
+    try:
+        gui_log(f"[BT-CONFIG] ensure wrapper skipped: {e}")
+    except Exception:
+        pass
+
+
+try:
+    gui_log("[BT-CONFIG v2026.07.05] Loaded: auto restore Angel config before backtest")
+except Exception:
+    print("[BT-CONFIG v2026.07.05] Loaded: auto restore Angel config before backtest")
+
+# ===== END AUTO RESTORE ANGEL CONFIG BEFORE BACKTEST =====
+
+
 if __name__ == "__main__":
     main()
 
