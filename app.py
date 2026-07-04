@@ -18166,6 +18166,29 @@ def fetch_angel_funds_snapshot(ensure_login=True):
 
 
 def auto_sync_capital_from_angel(force=False, reason="auto", ensure_login=True):
+    # PAPER MODE SAFETY: broker/RMS/live capital sync disabled
+    try:
+        _okai_mode_text = str(
+            config.get("trading_mode")
+            or config.get("trade_mode")
+            or config.get("mode")
+            or "PAPER"
+        ).strip().upper()
+    except Exception:
+        _okai_mode_text = "PAPER"
+
+    if _okai_mode_text not in {"LIVE", "REAL", "REAL_TRADE", "REALISTIC_LIVE"}:
+        try:
+            gui_log("Angel capital auto-sync skipped | MODE=PAPER | capital_source=PAPER_CAPITAL")
+        except Exception:
+            pass
+        return {
+            "status": "skipped",
+            "summary": "Paper mode - Angel capital sync skipped",
+            "amount": 0,
+            "source": "PAPER_CAPITAL",
+        }
+
     """Sync app capital from Angel RMS only when it is safe to change baseline."""
     global capital, paper_capital, _angel_capital_sync_last_ts
 
