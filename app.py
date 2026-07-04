@@ -24676,6 +24676,83 @@ except Exception:
 # ===== END BACKTEST 90% CAPITAL QTY ACTIVE BEFORE MAIN =====
 
 
+
+
+# ===== OPTION KING AI PATCH: BACKTEST ANGEL LOGIN BEFORE MAIN =====
+# Version: 2026.07.05-bt-login-before-main
+# Real backtest/monthly backtest se pehle Angel config + login ensure karega.
+
+def _okai_bt_required_angel_keys():
+    return ["api_key", "client_id", "password", "totp_secret"]
+
+
+def _okai_bt_missing_angel_keys():
+    try:
+        if not config:
+            load_config()
+    except Exception:
+        pass
+    return [k for k in _okai_bt_required_angel_keys() if not config.get(k)]
+
+
+def okai_ensure_angel_for_backtest():
+    global obj
+    try:
+        if not config:
+            load_config()
+    except Exception:
+        pass
+
+    missing = _okai_bt_missing_angel_keys()
+    if missing:
+        raise RuntimeError("Missing config: " + ", ".join(missing))
+
+    if obj is None:
+        angel_login()
+
+    if obj is None:
+        raise RuntimeError("Angel login failed: obj is None")
+
+    if not hasattr(obj, "getCandleData"):
+        raise RuntimeError("Angel login failed: getCandleData unavailable")
+
+    return obj
+
+
+try:
+    _OKAI_BT_LOGIN_MAIN_BASE_FETCH_BACKTEST = fetch_backtest_candles
+
+    def fetch_backtest_candles(day):
+        okai_ensure_angel_for_backtest()
+        return _OKAI_BT_LOGIN_MAIN_BASE_FETCH_BACKTEST(day)
+except Exception as e:
+    try:
+        gui_log(f"[BT-LOGIN-MAIN] fetch_backtest_candles guard install skipped: {e}")
+    except Exception:
+        pass
+
+
+try:
+    _OKAI_BT_LOGIN_MAIN_BASE_FETCH_REAL = fetch_real_historic_candles
+
+    def fetch_real_historic_candles(*args, **kwargs):
+        okai_ensure_angel_for_backtest()
+        return _OKAI_BT_LOGIN_MAIN_BASE_FETCH_REAL(*args, **kwargs)
+except Exception as e:
+    try:
+        gui_log(f"[BT-LOGIN-MAIN] fetch_real_historic_candles guard install skipped: {e}")
+    except Exception:
+        pass
+
+
+try:
+    gui_log("[BT-LOGIN-MAIN v2026.07.05] Loaded before main")
+except Exception:
+    print("[BT-LOGIN-MAIN v2026.07.05] Loaded before main")
+
+# ===== END BACKTEST ANGEL LOGIN BEFORE MAIN =====
+
+
 if __name__ == "__main__":
     main()
 
@@ -25337,4 +25414,68 @@ except Exception:
     gui_log("[BT-CAP90 v2026.07.04] Loaded")
 
 # ===== END BACKTEST 90% CAPITAL QTY =====
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      
+
+# ===== OPTION KING AI PATCH: BACKTEST ANGEL LOGIN GUARD =====
+# Version: 2026.07.05-bt-angel-login-guard
+# Real backtest se pehle Angel credentials + obj login ensure karta hai.
+
+def _okai_bt_missing_angel_keys():
+    try:
+        return [k for k in ["api_key", "client_id", "password", "totp_secret"] if not config.get(k)]
+    except Exception:
+        return ["api_key", "client_id", "password", "totp_secret"]
+
+
+def okai_ensure_angel_for_backtest():
+    global obj
+    try:
+        if not config:
+            load_config()
+    except Exception:
+        pass
+
+    missing = _okai_bt_missing_angel_keys()
+    if missing:
+        raise RuntimeError("Missing config: " + ", ".join(missing))
+
+    if obj is None:
+        angel_login()
+
+    if obj is None:
+        raise RuntimeError("Angel login failed: obj is None")
+
+    return obj
+
+
+try:
+    _OKAI_BT_LOGIN_BASE_FETCH_BACKTEST_CANDLES = fetch_backtest_candles
+
+    def fetch_backtest_candles(day):
+        okai_ensure_angel_for_backtest()
+        return _OKAI_BT_LOGIN_BASE_FETCH_BACKTEST_CANDLES(day)
+except Exception as e:
+    try:
+        gui_log(f"[BT-LOGIN] fetch_backtest_candles guard install skipped: {e}")
+    except Exception:
+        pass
+
+
+try:
+    _OKAI_BT_LOGIN_BASE_FETCH_REAL_HIST = fetch_real_historic_candles
+
+    def fetch_real_historic_candles(*args, **kwargs):
+        okai_ensure_angel_for_backtest()
+        return _OKAI_BT_LOGIN_BASE_FETCH_REAL_HIST(*args, **kwargs)
+except Exception as e:
+    try:
+        gui_log(f"[BT-LOGIN] fetch_real_historic_candles guard install skipped: {e}")
+    except Exception:
+        pass
+
+
+try:
+    gui_log("[BT-LOGIN v2026.07.05] Loaded: Angel login ensured before real backtest")
+except Exception:
+    print("[BT-LOGIN v2026.07.05] Loaded")
+
+# ===== END BACKTEST ANGEL LOGIN GUARD =====
