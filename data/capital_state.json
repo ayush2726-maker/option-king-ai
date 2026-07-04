@@ -1,9 +1,10 @@
 {
-  "capital": 2901.6863,
-  "paper_capital": 2901.6863,
+  "capital": 100000.0,
+  "paper_capital": 100000.0,
   "daily_pnl": 0.0,
   "trades_taken": 0,
-  "market_day": "2026-07-03",
-  "updated_at": "2026-07-03T15:56:09",
-  "reason": "live_only_load_history"
+  "market_day": "20260704",
+  "updated_at": "2026-07-04T17:26:22",
+  "reason": "manual_reset_after_angel_sync_skip",
+  "capital_source": "PAPER_CAPITAL"
 }
