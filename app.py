@@ -24723,3 +24723,84 @@ def safety_trade_limits_block_reason():
     return _OKAI_LIMITS_BASE_SAFETY_BLOCK()
 
 _okai_fix_log("[LIMITS PATCH v2026.06.29] Loaded: max_trades=10 | max_losses=4 | daily_loss=8%")
+
+
+# ===== OPTION KING AI PATCH: PAPER MODE - NO LIVE RMS SYNC =====
+# Version: 2026.06.30-paper-no-rms-1
+# Paper mode should NEVER call Angel rmsLimit() - this was causing
+# unnecessary API calls contributing to rate limiting (AB1021)
+
+_OKAI_PAPERFIX_BASE_AUTO_SYNC = auto_sync_capital_from_angel
+
+def auto_sync_capital_from_angel(force=False, reason="auto", ensure_login=True):
+    if not is_live_mode():
+        return {
+            "status": "skipped",
+            "summary": "Paper mode - RMS sync skipped to avoid rate limiting",
+            "amount": 0,
+            "source": "PAPER_SKIP",
+        }
+    return _OKAI_PAPERFIX_BASE_AUTO_SYNC(force=force, reason=reason, ensure_login=ensure_login)
+
+_okai_fix_log("[PAPERFIX PATCH v2026.06.30] Loaded: RMS sync disabled in paper mode")
+
+
+# ===== OPTION KING AI PATCH: LTP CACHE/THROTTLE =====
+# Version: 2026.06.30-ltp-throttle-1
+# Cache LTP for 3 seconds per symbol to reduce API call frequency
+# and avoid AB1021 "Too many requests" errors
+
+_OKAI_LTPCACHE_BASE_GET_LTP = get_ltp
+_okai_ltp_cache = {}
+_OKAI_LTP_CACHE_SECONDS = 3.0
+
+def get_ltp(exchange, symbol, token):
+    cache_key = f"{exchange}:{symbol}:{token}"
+    now_ts = time.time()
+    cached = _okai_ltp_cache.get(cache_key)
+    if cached and (now_ts - cached[1]) < _OKAI_LTP_CACHE_SECONDS:
+        return cached[0]
+    result = _OKAI_LTPCACHE_BASE_GET_LTP(exchange, symbol, token)
+    if result is not None:
+        _okai_ltp_cache[cache_key] = (result, now_ts)
+    return result
+
+_OKAI_NIFTYCACHE_BASE_GET_PRICE = get_nifty_price
+_okai_nifty_cache = {"value": None, "ts": 0}
+
+def get_nifty_price():
+    now_ts = time.time()
+    if _okai_nifty_cache["value"] is not None and (now_ts - _okai_nifty_cache["ts"]) < _OKAI_LTP_CACHE_SECONDS:
+        return _okai_nifty_cache["value"]
+    result = _OKAI_NIFTYCACHE_BASE_GET_PRICE()
+    if result is not None:
+        _okai_nifty_cache["value"] = result
+        _okai_nifty_cache["ts"] = now_ts
+    return result
+
+_okai_fix_log("[LTPCACHE PATCH v2026.06.30] Loaded: 3-second LTP/Nifty price caching")
+
+
+# ===== OPTION KING AI PATCH: MTF SOFT OVERRIDE =====
+# Version: 2026.07.01-mtf-soft-1
+# Lower MTF strong override threshold from 78 to 60
+
+_OKAI_MTFSOFT_BASE_CONFIG_FLOAT = _okai_config_float
+
+def _okai_config_float(key, default=0.0, min_val=None, max_val=None):
+    if key == "tqu_mtf_strong_override":
+        val = _OKAI_MTFSOFT_BASE_CONFIG_FLOAT(key, 60.0, min_val, max_val)
+        return min(val, 60.0)
+    return _OKAI_MTFSOFT_BASE_CONFIG_FLOAT(key, default, min_val, max_val)
+
+_okai_fix_log("[MTFSOFT PATCH v2026.07.01] Loaded: MTF override threshold 78->60")
+
+# ===== OPTION KING AI PATCH: DISABLE 5M MTF CHECK (NOMTF) =====
+# Reverts to pre-MTF strategy: 5-min candle EMA9 trend gate fully OFF
+_OKAI_NOMTF_BASE_MTF_ENABLED = _tqu_mtf_enabled
+
+def _tqu_mtf_enabled():
+    return False
+
+_okai_fix_log("[NOMTF PATCH v2026.07.04] Loaded: 5m MTF check disabled, reverted to pre-MTF entry logic")
+# ===== END NOMTF PATCH =====
