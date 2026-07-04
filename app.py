@@ -25113,3 +25113,129 @@ except Exception:
     gui_log("[PAPER-ISO FINAL v2026.07.04] Loaded")
 
 # ===== END PAPER CAPITAL ISOLATION FINAL =====
+
+# ===== OPTION KING AI PATCH: BACKTEST 90% CAPITAL QTY =====
+# Version: 2026.07.04-backtest-cap90-final
+# Backtest qty ko paper capital ke hisab se realistic 90% capital use par lao.
+# Live/paper running trade ko touch nahi karta, only backtest sizing.
+
+def _okai_bt_cap90_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def okai_backtest_capital_use_percent():
+    try:
+        val = float(config.get("backtest_capital_use_percent", 90.0))
+    except Exception:
+        val = 90.0
+    return max(1.0, min(val, 100.0))
+
+
+def okai_backtest_use_risk_cap():
+    # Default OFF because user wants backtest to use capital sizing, not 1-lot risk clamp.
+    val = str(config.get("backtest_use_risk_cap", "false")).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def okai_backtest_max_risk_percent():
+    try:
+        val = float(config.get("backtest_max_risk_per_trade_percent", 8.0))
+    except Exception:
+        val = 8.0
+    return max(0.0, min(val, 100.0))
+
+
+try:
+    _OKAI_BT_CAP90_BASE_BACKTEST_QTY = backtest_qty
+
+    def backtest_qty(bt_capital, premium, trade_type, lot_size):
+        premium = _okai_bt_cap90_float(premium, 0)
+        lot_size = int(_okai_bt_cap90_float(lot_size, FAST_LOT_SIZE))
+        bt_capital = _okai_bt_cap90_float(bt_capital, 0)
+
+        if premium <= 0 or lot_size <= 0 or bt_capital <= 0:
+            return 0, 0
+
+        usable_capital = bt_capital * (okai_backtest_capital_use_percent() / 100.0)
+        max_lots = int(usable_capital // (premium * lot_size))
+
+        if max_lots <= 0:
+            return 0, 0
+
+        used_lots = qty_lots_for_trade_type(max_lots, trade_type)
+        qty = used_lots * lot_size
+
+        try:
+            gui_log(
+                f"[BT-CAP90] Capital {bt_capital:.0f} | Use {okai_backtest_capital_use_percent():.0f}% "
+                f"| Premium {premium:.2f} | Max lots {max_lots} | Used lots {used_lots} | Qty {qty}"
+            )
+        except Exception:
+            pass
+
+        return qty, max_lots
+except Exception:
+    pass
+
+
+try:
+    _OKAI_BT_CAP90_BASE_RISK_CAP_QTY = backtest_risk_cap_qty
+
+    def backtest_risk_cap_qty(bt_capital, qty, premium, lot_size, sl_percent):
+        qty = int(qty or 0)
+        premium = _okai_bt_cap90_float(premium, 0)
+        lot_size = int(_okai_bt_cap90_float(lot_size, FAST_LOT_SIZE))
+        bt_capital = _okai_bt_cap90_float(bt_capital, 0)
+        sl_percent = _okai_bt_cap90_float(sl_percent, SL_PERCENT)
+
+        if qty <= 0 or premium <= 0 or lot_size <= 0:
+            return 0
+
+        if not okai_backtest_use_risk_cap():
+            return qty
+
+        risk_pct = okai_backtest_max_risk_percent()
+        if risk_pct <= 0:
+            return qty
+
+        max_risk_amount = bt_capital * (risk_pct / 100.0)
+        sl_amount_per_qty = premium * (sl_percent / 100.0)
+
+        if max_risk_amount <= 0 or sl_amount_per_qty <= 0:
+            return qty
+
+        max_qty_by_risk = int(max_risk_amount // sl_amount_per_qty)
+        risk_qty = (max_qty_by_risk // lot_size) * lot_size
+        final_qty = min(qty, risk_qty)
+
+        try:
+            if final_qty < qty:
+                gui_log(
+                    f"[BT-CAP90] Risk cap applied | Requested {qty} | Final {final_qty} "
+                    f"| Risk {risk_pct:.1f}%"
+                )
+        except Exception:
+            pass
+
+        return max(0, final_qty)
+except Exception:
+    pass
+
+try:
+    config["backtest_capital_use_percent"] = float(config.get("backtest_capital_use_percent", 90.0))
+    config["backtest_use_risk_cap"] = str(config.get("backtest_use_risk_cap", "false")).lower()
+    save_cloud_config()
+except Exception:
+    pass
+
+try:
+    _okai_fix_log("[BT-CAP90 v2026.07.04] Loaded: backtest uses 90% capital; risk cap optional")
+except Exception:
+    gui_log("[BT-CAP90 v2026.07.04] Loaded")
+
+# ===== END BACKTEST 90% CAPITAL QTY =====
