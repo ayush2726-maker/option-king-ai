@@ -4067,14 +4067,35 @@ def run_actual_trade_replay_backtest(payload=None):
 
 def run_mobile_backtest(payload=None):
     payload = payload or {}
-    _bt_mode = str(payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "").upper().replace("-", "_").replace(" ", "_")
-    if _bt_mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY"):
+
+    raw_mode = payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "FAST"
+    mode = str(raw_mode or "FAST").upper().replace("-", "_").replace(" ", "_")
+
+    start_capital = float(payload.get("capital") or paper_capital or capital)
+
+    if mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY", "REAL_TRADE_REPLAY"):
         return run_actual_trade_replay_backtest(payload)
 
-    mode = str(payload.get("mode", "FAST") or "FAST").upper()
-    start_capital = float(payload.get("capital") or paper_capital or capital)
-    if mode in {"MONTH", "MONTHLY"}:
-        return run_mobile_monthly_backtest(payload, "MONTHLY", start_capital)
+    monthly_modes = {
+        "MONTH",
+        "MONTHLY",
+        "REALISTIC_MONTHLY",
+        "AI_REALISTIC_MONTHLY",
+        "MONTH_REAL",
+        "REAL_MONTH",
+        "REAL_MONTHLY",
+    }
+
+    if mode in monthly_modes or payload.get("month"):
+        month_text = str(payload.get("month") or "").strip()
+        if not month_text:
+            raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
+
+        # Strict fix:
+        # Selected month must be used.
+        # Never fallback to current/latest date for monthly backtest.
+        return run_mobile_monthly_backtest(payload, mode, start_capital)
+
     day = parse_backtest_day(payload.get("date"))
     result = run_mobile_backtest_day(mode, day, start_capital)
     return result["summary"], result["report"]
