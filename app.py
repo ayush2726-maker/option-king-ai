@@ -25509,6 +25509,41 @@ except Exception as _e:
 # OKAI STATUS CHART BRIDGE V1 END
 
 
+
+
+# OKAI HARD DISABLE MTF V2 START
+try:
+    config["tqu_mtf_enabled"] = False
+    config["mtf_enabled"] = False
+    config["multi_timeframe_enabled"] = False
+except Exception:
+    pass
+
+def _tqu_mtf_enabled():
+    return False
+
+def _tqu_5m_trend(signal=None, *args, **kwargs):
+    return True, "MTF hard disabled"
+
+try:
+    _OKAI_HARD_NOMTF_BASE_MULTI_TIMEFRAME_TREND = multi_timeframe_trend
+    def multi_timeframe_trend(df=None, *args, **kwargs):
+        return {
+            "bias": "NEUTRAL",
+            "score": 0,
+            "reason": "MTF hard disabled",
+            "enabled": False,
+        }
+except Exception:
+    pass
+
+try:
+    gui_log("OKAI HARD DISABLE MTF V2 active")
+except Exception:
+    pass
+# OKAI HARD DISABLE MTF V2 END
+
+
 if __name__ == "__main__":
     main()
 
