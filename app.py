@@ -25072,6 +25072,15 @@ try:
         if clean_path in ("/phone_server_update.json", "/mobile_app_update.json", "/update.json"):
             import json as _json
             import time as _time
+            import hashlib as _hashlib
+
+            # OKAI PHONE UPDATE SHA256 V1
+            try:
+                _file = globals().get("__file__") or "app.py"
+                with open(_file, "rb") as _fh:
+                    _sha256 = _hashlib.sha256(_fh.read()).hexdigest()
+            except Exception:
+                _sha256 = "0" * 64
 
             try:
                 ver = str(
@@ -25092,10 +25101,24 @@ try:
                 "server_version": ver,
                 "message": "OKAI mobile update endpoint OK",
                 "timestamp": int(_time.time()),
+                "sha256": _sha256,
+                "checksum": _sha256,
+                "download_url": "",
+                "url": "",
+                "manifest": {
+                    "sha256": _sha256,
+                    "update_available": False,
+                    "download_url": "",
+                    "url": ""
+                },
                 "data": {
                     "update_available": False,
                     "version": ver,
-                    "server_reachable": True
+                    "server_reachable": True,
+                    "sha256": _sha256,
+                    "checksum": _sha256,
+                    "download_url": "",
+                    "url": ""
                 }
             }
 
