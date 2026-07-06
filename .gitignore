@@ -24,3 +24,6 @@ __pycache__/
 *.pyc
 *.zip
 tmp_*.py
+secrets.json
+users/owner/secrets.json
+users/**/secrets.json
