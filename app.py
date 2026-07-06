@@ -25413,6 +25413,102 @@ except Exception:
 # OKAI ANGEL CONFIG PRESERVE V1 END
 
 
+
+
+# OKAI STATUS CHART BRIDGE V1 START
+try:
+    _OKAI_STATUS_CHART_BASE_STATUS_PAYLOAD = status_payload
+
+    def _okai_last_from_list(x, default=None):
+        try:
+            if isinstance(x, list) and x:
+                return x[-1]
+        except Exception:
+            pass
+        return default
+
+    def status_payload():
+        payload = {}
+        try:
+            payload = _OKAI_STATUS_CHART_BASE_STATUS_PAYLOAD() or {}
+        except Exception as _e:
+            try:
+                gui_log(f"STATUS CHART BRIDGE base fallback: {_e}")
+            except Exception:
+                pass
+            payload = {}
+
+        try:
+            cp = chart_payload() or {}
+            if isinstance(cp, dict) and isinstance(cp.get("data"), dict):
+                cp = cp.get("data")
+
+            close = cp.get("close") or []
+            labels = cp.get("labels") or []
+
+            last_close = _okai_last_from_list(close, 0) or 0
+            try:
+                last_close = float(last_close or 0)
+            except Exception:
+                last_close = 0
+
+            payload["nifty"] = last_close
+            payload["nifty_price"] = last_close
+            payload["last_price"] = last_close
+            payload["ltp"] = last_close
+
+            payload["chart_count"] = len(close)
+            payload["chart_message"] = cp.get("message") or ("Chart OK" if close else "Waiting for candle data")
+            payload["chart_state"] = cp.get("state", "")
+
+            payload["ema9"] = _okai_last_from_list(cp.get("ema9"), None)
+            payload["ema21"] = _okai_last_from_list(cp.get("ema21"), None)
+            payload["vwap"] = _okai_last_from_list(cp.get("vwap"), None)
+            payload["supertrend"] = _okai_last_from_list(cp.get("supertrend"), None)
+            payload["supertrend_dir"] = _okai_last_from_list(cp.get("supertrend_dir"), None)
+            payload["adx"] = _okai_last_from_list(cp.get("adx") or cp.get("adx14"), None)
+            payload["plus_di"] = _okai_last_from_list(cp.get("plus_di") or cp.get("pdi"), None)
+            payload["minus_di"] = _okai_last_from_list(cp.get("minus_di") or cp.get("mdi"), None)
+
+            if labels:
+                payload["last_candle_time"] = labels[-1]
+
+            payload["okai_status_chart_bridge"] = True
+
+        except Exception as _e:
+            try:
+                gui_log(f"STATUS CHART BRIDGE skipped: {_e}")
+            except Exception:
+                pass
+
+        try:
+            payload.setdefault("running", True)
+            payload.setdefault("mode", trade_mode())
+            payload.setdefault("trade_mode", trade_mode())
+            payload.setdefault("live_trading_enabled", live_trading_enabled())
+            payload.setdefault("capital", float(globals().get("capital", config.get("capital", 0)) or 0))
+            payload.setdefault("paper_capital", float(config.get("paper_capital", globals().get("capital", 0)) or 0))
+            payload.setdefault("daily_pnl", float(globals().get("daily_pnl", 0) or 0))
+            payload.setdefault("closed_trades", len(globals().get("trade_history", []) or []))
+            payload.setdefault("trade_count", len(globals().get("trade_history", []) or []))
+        except Exception:
+            pass
+
+        return payload
+
+    try:
+        gui_log("OKAI STATUS CHART BRIDGE V1 active")
+    except Exception:
+        pass
+
+except Exception as _e:
+    try:
+        gui_log(f"OKAI STATUS CHART BRIDGE V1 skipped: {_e}")
+    except Exception:
+        pass
+# OKAI STATUS CHART BRIDGE V1 END
+
+
 if __name__ == "__main__":
     main()
 
