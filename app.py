@@ -25150,6 +25150,27 @@ except Exception as _e:
 # OKAI PHONE UPDATE ROUTE V1 END
 
 
+
+
+# OKAI SERVER REUSE ADDRESS V1 START
+try:
+    ThreadingHTTPServer.allow_reuse_address = True
+    try:
+        ThreadingHTTPServer.allow_reuse_port = True
+    except Exception:
+        pass
+    try:
+        gui_log("OKAI SERVER REUSE ADDRESS V1 active")
+    except Exception:
+        pass
+except Exception as _e:
+    try:
+        gui_log(f"OKAI SERVER REUSE ADDRESS V1 skipped: {_e}")
+    except Exception:
+        pass
+# OKAI SERVER REUSE ADDRESS V1 END
+
+
 if __name__ == "__main__":
     main()
 
