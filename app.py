@@ -25544,6 +25544,283 @@ except Exception:
 # OKAI HARD DISABLE MTF V2 END
 
 
+
+
+# OKAI SECRET VAULT V1 START
+def _okai_secret_vault_load():
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        _base = _Path(__file__).resolve().parent
+        _cwd = _Path.cwd()
+
+        _paths = [
+            _base / "secrets.json",
+            _cwd / "secrets.json",
+            _cwd / "users" / "owner" / "secrets.json",
+            _base / "config_backup.json",
+            _base / "config_before_tqu_fix.json",
+            _base / "config_before_capital_fix.json",
+        ]
+
+        _secret = {}
+
+        for _p in _paths:
+            try:
+                if not _p.exists():
+                    continue
+                _d = _json.loads(_p.read_text(encoding="utf-8"))
+                if not isinstance(_d, dict):
+                    continue
+                for _k, _v in _d.items():
+                    if str(_v or "").strip() and not str(_secret.get(_k) or "").strip():
+                        _secret[_k] = _v
+            except Exception:
+                pass
+
+        return _secret
+    except Exception:
+        return {}
+
+
+def _okai_secret_vault_apply():
+    try:
+        global config
+
+        _secret = _okai_secret_vault_load()
+        if not isinstance(config, dict):
+            return False
+
+        _keys = [
+            "api_key", "client_id", "password", "totp_secret",
+            "client_code", "pin",
+            "telegram_token", "telegram_bot_token", "bot_token",
+            "chat_id", "telegram_chat_id", "telegram_user_id",
+            "api_token", "mobile_api_token", "server_api_token", "token",
+        ]
+
+        _changed = False
+
+        for _k in _keys:
+            _v = _secret.get(_k)
+            if str(_v or "").strip() and not str(config.get(_k) or "").strip():
+                config[_k] = _v
+                _changed = True
+
+        if str(config.get("client_id") or "").strip():
+            config["client_code"] = config.get("client_id")
+        if str(config.get("password") or "").strip():
+            config["pin"] = config.get("password")
+
+        if str(config.get("api_token") or "").strip() == "":
+            config["api_token"] = "optionking-local"
+        if str(config.get("mobile_api_token") or "").strip() == "":
+            config["mobile_api_token"] = config.get("api_token")
+        if str(config.get("server_api_token") or "").strip() == "":
+            config["server_api_token"] = config.get("api_token")
+        if str(config.get("token") or "").strip() == "":
+            config["token"] = config.get("api_token")
+
+        if str(__file__).replace("\\", "/").endswith("/users/owner/app.py"):
+            config["host"] = "127.0.0.1"
+            config["port"] = 18765
+
+        return _changed
+
+    except Exception:
+        return False
+
+
+try:
+    _OKAI_SECRET_BASE_LOAD_CONFIG = load_config
+
+    def load_config():
+        _r = _OKAI_SECRET_BASE_LOAD_CONFIG()
+        _okai_secret_vault_apply()
+        return _r
+except Exception:
+    pass
+
+
+try:
+    _OKAI_SECRET_BASE_SAVE_CONFIG = save_config
+
+    def save_config():
+        _okai_secret_vault_apply()
+        return _OKAI_SECRET_BASE_SAVE_CONFIG()
+except Exception:
+    pass
+
+
+try:
+    _OKAI_SECRET_BASE_SAVE_CLOUD_CONFIG = save_cloud_config
+
+    def save_cloud_config():
+        _okai_secret_vault_apply()
+        return _OKAI_SECRET_BASE_SAVE_CLOUD_CONFIG()
+except Exception:
+    pass
+
+
+try:
+    gui_log("OKAI SECRET VAULT V1 active")
+except Exception:
+    pass
+# OKAI SECRET VAULT V1 END
+
+
+
+
+# OKAI MOBILE LTP FALLBACK V1 START
+try:
+    _OKAI_LTP_FALLBACK_CACHE = {"ts": 0.0, "ltp": 0.0}
+
+    def _okai_direct_nifty_ltp_fallback():
+        try:
+            import time as _time
+            now = _time.time()
+
+            cached_ltp = float(_OKAI_LTP_FALLBACK_CACHE.get("ltp") or 0)
+            cached_ts = float(_OKAI_LTP_FALLBACK_CACHE.get("ts") or 0)
+
+            # Angel login baar-baar na ho, 90 sec cache
+            if cached_ltp > 0 and (now - cached_ts) < 90:
+                return cached_ltp
+
+            import pyotp as _pyotp
+            from SmartApi import SmartConnect as _SmartConnect
+
+            _okai_secret_vault_apply()
+
+            api_key = str(config.get("api_key") or "").strip()
+            client_id = str(config.get("client_id") or config.get("client_code") or "").strip()
+            password = str(config.get("password") or config.get("pin") or "").strip()
+            totp_secret = str(config.get("totp_secret") or "").strip()
+
+            if not (api_key and client_id and password and totp_secret):
+                return 0.0
+
+            obj = _SmartConnect(api_key=api_key)
+            totp = _pyotp.TOTP(totp_secret).now()
+            res = obj.generateSession(client_id, password, totp)
+
+            if not isinstance(res, dict) or not res.get("status"):
+                return 0.0
+
+            ltp_res = obj.ltpData("NSE", "NIFTY", "26000")
+            ltp = float(((ltp_res or {}).get("data") or {}).get("ltp") or 0)
+
+            if ltp > 0:
+                _OKAI_LTP_FALLBACK_CACHE["ts"] = now
+                _OKAI_LTP_FALLBACK_CACHE["ltp"] = ltp
+                return ltp
+
+        except Exception as exc:
+            try:
+                gui_log(f"MOBILE LTP FALLBACK skipped: {exc}")
+            except Exception:
+                pass
+
+        return 0.0
+
+
+    _OKAI_MOBILE_LTP_BASE_STATUS_PAYLOAD = status_payload
+
+    def status_payload():
+        payload = {}
+        try:
+            payload = _OKAI_MOBILE_LTP_BASE_STATUS_PAYLOAD() or {}
+        except Exception:
+            payload = {}
+
+        try:
+            current = float(
+                payload.get("nifty")
+                or payload.get("nifty_price")
+                or payload.get("last_price")
+                or payload.get("ltp")
+                or 0
+            )
+        except Exception:
+            current = 0.0
+
+        if current <= 0:
+            ltp = _okai_direct_nifty_ltp_fallback()
+            if ltp > 0:
+                payload["nifty"] = ltp
+                payload["nifty_price"] = ltp
+                payload["last_price"] = ltp
+                payload["ltp"] = ltp
+                payload["spot_price"] = ltp
+                payload["chart_message"] = "LTP fallback active; candles not ready"
+                payload["okai_mobile_ltp_fallback"] = True
+                payload["mobile_data_ok"] = True
+
+        return payload
+
+
+    try:
+        _OKAI_MOBILE_LTP_BASE_CHART_PAYLOAD = chart_payload
+
+        def chart_payload():
+            cp = _OKAI_MOBILE_LTP_BASE_CHART_PAYLOAD() or {}
+
+            wrapped = isinstance(cp, dict) and isinstance(cp.get("data"), dict)
+            data = cp.get("data") if wrapped else cp
+
+            try:
+                close = data.get("close") or []
+            except Exception:
+                close = []
+
+            if not close:
+                ltp = _okai_direct_nifty_ltp_fallback()
+                if ltp > 0:
+                    from datetime import datetime as _dt
+                    label = _dt.now().strftime("%d %b %H:%M")
+
+                    data.update({
+                        "timestamp": _dt.now().isoformat(timespec="seconds"),
+                        "labels": [label],
+                        "open": [ltp],
+                        "high": [ltp],
+                        "low": [ltp],
+                        "close": [ltp],
+                        "volume": [0],
+                        "ema9": [ltp],
+                        "ema21": [ltp],
+                        "vwap": [ltp],
+                        "supertrend": [ltp],
+                        "message": "LTP fallback active; candle data not ready",
+                        "state": "ltp_fallback",
+                        "okai_mobile_ltp_fallback": True,
+                    })
+
+                    if wrapped:
+                        cp["data"] = data
+                    else:
+                        cp = data
+
+            return cp
+
+    except Exception:
+        pass
+
+
+    try:
+        gui_log("OKAI MOBILE LTP FALLBACK V1 active")
+    except Exception:
+        pass
+
+except Exception as _e:
+    try:
+        gui_log(f"OKAI MOBILE LTP FALLBACK V1 skipped: {_e}")
+    except Exception:
+        pass
+# OKAI MOBILE LTP FALLBACK V1 END
+
+
 if __name__ == "__main__":
     main()
 
