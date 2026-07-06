@@ -25171,6 +25171,36 @@ except Exception as _e:
 # OKAI SERVER REUSE ADDRESS V1 END
 
 
+
+
+# OKAI API TOKEN ENV FALLBACK V1 START
+def api_token():
+    try:
+        import os as _os
+
+        # Multi-user gateway worker token
+        for _k in ("OPTIONKING_USER_TOKEN", "OPTIONKING_API_TOKEN", "API_TOKEN"):
+            _v = str(_os.environ.get(_k) or "").strip()
+            if _v:
+                return _v
+
+        # Normal config token
+        for _k in ("api_token", "mobile_api_token", "server_api_token", "token"):
+            _v = str(config.get(_k) or "").strip()
+            if _v:
+                return _v
+
+        # Owner local fallback
+        if str(_os.environ.get("OPTIONKING_USER_ID") or "").strip() == "owner":
+            return "optionking-owner-local"
+
+    except Exception:
+        pass
+
+    return ""
+# OKAI API TOKEN ENV FALLBACK V1 END
+
+
 if __name__ == "__main__":
     main()
 
