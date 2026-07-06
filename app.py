@@ -179,8 +179,7 @@ SERVER_VERSION = "2026.05.23-mobile-update-2"
 MOBILE_APP_VERSION = "1.0.0-build28-update-clean"
 DEFAULT_MOBILE_APP_UPDATE_URL = "https://expo.dev/artifacts/eas/b4zgvyqwX9V7Hdr4CdSV6k.apk"
 DEFAULT_UPDATE_MANIFEST_URLS = [
-    "http://100.112.194.74:8790/phone_server_update.json",
-    "http://192.168.29.176:8790/phone_server_update.json",
+    "http://127.0.0.1:8765/phone_server_update.json",
 ]
 AUTO_UPDATE_INTERVAL_SECONDS = 300
 
@@ -4086,15 +4085,23 @@ def run_mobile_backtest(payload=None):
         "REAL_MONTHLY",
     }
 
+    # Mobile Month (Real) sends mode REALISTIC_MONTHLY and month YYYY-MM.
+    # It must run selected full month, not fallback to daily/latest date.
     if mode in monthly_modes or payload.get("month"):
         month_text = str(payload.get("month") or "").strip()
-        if not month_text:
+        if not re.match(r"^\d{4}-\d{2}$", month_text):
             raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
 
-        # Strict fix:
-        # Selected month must be used.
-        # Never fallback to current/latest date for monthly backtest.
-        return run_mobile_monthly_backtest(payload, mode, start_capital)
+        summary, report = run_mobile_monthly_backtest(payload, mode, start_capital)
+
+        if month_text not in str(summary) and month_text not in str(report):
+            raise RuntimeError(f"Monthly backtest failed: selected month {month_text} not found in report")
+
+        wrong_daily = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", str(report))
+        if wrong_daily and not wrong_daily.group(1).startswith(month_text):
+            raise RuntimeError(f"Monthly backtest returned date outside selected month: {wrong_daily.group(1)}")
+
+        return summary, report
 
     day = parse_backtest_day(payload.get("date"))
     result = run_mobile_backtest_day(mode, day, start_capital)
@@ -6186,26 +6193,46 @@ _OKAI_ESTIMATED_RUN_MOBILE_BACKTEST = run_mobile_backtest
 
 def run_mobile_backtest(payload=None):
     payload = payload or {}
-    mode = str(payload.get("mode", "FAST") or "FAST").upper()
+
+    raw_mode = payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "FAST"
+    mode = str(raw_mode or "FAST").upper().replace("-", "_").replace(" ", "_")
+
     start_capital = float(payload.get("capital") or paper_capital or capital)
-    if mode in ACTUAL_REPLAY_MODES:
-        day = parse_backtest_day(payload.get("date"))
-        return actual_replay_report_for_day(day)
-    if realistic_monthly_backtest_mode(mode):
-        return run_realistic_monthly_backtest(payload, "REALISTIC_MONTHLY", start_capital)
-    if realistic_backtest_mode(mode):
-        day = parse_backtest_day(payload.get("date"))
-        result = run_realistic_backtest_day("REALISTIC", day, start_capital)
-        return result["summary"], result["report"]
-    return _OKAI_ESTIMATED_RUN_MOBILE_BACKTEST(payload)
 
-# ===== END PATCH =====
+    if mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY", "REAL_TRADE_REPLAY"):
+        return run_actual_trade_replay_backtest(payload)
 
+    monthly_modes = {
+        "MONTH",
+        "MONTHLY",
+        "REALISTIC_MONTHLY",
+        "AI_REALISTIC_MONTHLY",
+        "MONTH_REAL",
+        "REAL_MONTH",
+        "REAL_MONTHLY",
+    }
 
-# ===== OPTION KING AI PATCH: PERSIST CAPITAL ACROSS SERVER UPDATES =====
-# Version: 2026.05.16-capital-state-1
+    # Mobile Month (Real) sends mode REALISTIC_MONTHLY and month YYYY-MM.
+    # It must run selected full month, not fallback to daily/latest date.
+    if mode in monthly_modes or payload.get("month"):
+        month_text = str(payload.get("month") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}$", month_text):
+            raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
 
-CAPITAL_STATE_PATH = os.path.join(DATA_DIR, "capital_state.json")
+        summary, report = run_mobile_monthly_backtest(payload, mode, start_capital)
+
+        if month_text not in str(summary) and month_text not in str(report):
+            raise RuntimeError(f"Monthly backtest failed: selected month {month_text} not found in report")
+
+        wrong_daily = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", str(report))
+        if wrong_daily and not wrong_daily.group(1).startswith(month_text):
+            raise RuntimeError(f"Monthly backtest returned date outside selected month: {wrong_daily.group(1)}")
+
+        return summary, report
+
+    day = parse_backtest_day(payload.get("date"))
+    result = run_mobile_backtest_day(mode, day, start_capital)
+    return result["summary"], result["report"]
 
 
 def save_capital_state(reason=""):
@@ -12121,11 +12148,46 @@ def backtest_real_monthly_enabled():
 
 def run_mobile_backtest(payload=None):
     payload = payload or {}
-    mode = str(payload.get("mode", "FAST") or "FAST").upper()
+
+    raw_mode = payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "FAST"
+    mode = str(raw_mode or "FAST").upper().replace("-", "_").replace(" ", "_")
+
     start_capital = float(payload.get("capital") or paper_capital or capital)
-    if realistic_monthly_backtest_mode(mode) and not backtest_real_monthly_enabled():
-        return run_mobile_monthly_backtest(payload, "MONTHLY", start_capital)
-    return _OKAI_AI_BT_BASE_RUN_MOBILE_BACKTEST(payload)
+
+    if mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY", "REAL_TRADE_REPLAY"):
+        return run_actual_trade_replay_backtest(payload)
+
+    monthly_modes = {
+        "MONTH",
+        "MONTHLY",
+        "REALISTIC_MONTHLY",
+        "AI_REALISTIC_MONTHLY",
+        "MONTH_REAL",
+        "REAL_MONTH",
+        "REAL_MONTHLY",
+    }
+
+    # Mobile Month (Real) sends mode REALISTIC_MONTHLY and month YYYY-MM.
+    # It must run selected full month, not fallback to daily/latest date.
+    if mode in monthly_modes or payload.get("month"):
+        month_text = str(payload.get("month") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}$", month_text):
+            raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
+
+        summary, report = run_mobile_monthly_backtest(payload, mode, start_capital)
+
+        if month_text not in str(summary) and month_text not in str(report):
+            raise RuntimeError(f"Monthly backtest failed: selected month {month_text} not found in report")
+
+        wrong_daily = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", str(report))
+        if wrong_daily and not wrong_daily.group(1).startswith(month_text):
+            raise RuntimeError(f"Monthly backtest returned date outside selected month: {wrong_daily.group(1)}")
+
+        return summary, report
+
+    day = parse_backtest_day(payload.get("date"))
+    result = run_mobile_backtest_day(mode, day, start_capital)
+    return result["summary"], result["report"]
 
 
 def apply_live_strategy_runtime_settings():
@@ -14993,39 +15055,46 @@ def _okai_fast_estimate_signal(df, index, orb_high_value, orb_low_value, gap_day
 
 def run_mobile_backtest(payload=None):
     payload = payload or {}
-    mode = str(payload.get("mode", "FAST") or "FAST").upper()
+
+    raw_mode = payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "FAST"
+    mode = str(raw_mode or "FAST").upper().replace("-", "_").replace(" ", "_")
+
     start_capital = float(payload.get("capital") or paper_capital or capital)
-    if mode in STORED_REPLAY_MODES:
-        return _okai_stored_trade_report(payload, mode, start_capital)
 
-    # FAST is a quick local estimate. Keep it lightweight so the phone does not
-    # spend minutes recomputing the weighted AI stack candle-by-candle.
-    if mode in {"FAST", "ESTIMATE", "QUICK"}:
-        original = globals().get("backtest_signal")
-        try:
-            globals()["backtest_signal"] = _okai_fast_estimate_signal
-            return _OKAI_STORED_BASE_RUN_MOBILE_BACKTEST(payload)
-        finally:
-            globals()["backtest_signal"] = original
+    if mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY", "REAL_TRADE_REPLAY"):
+        return run_actual_trade_replay_backtest(payload)
 
-    return _OKAI_STORED_BASE_RUN_MOBILE_BACKTEST(payload)
+    monthly_modes = {
+        "MONTH",
+        "MONTHLY",
+        "REALISTIC_MONTHLY",
+        "AI_REALISTIC_MONTHLY",
+        "MONTH_REAL",
+        "REAL_MONTH",
+        "REAL_MONTHLY",
+    }
 
+    # Mobile Month (Real) sends mode REALISTIC_MONTHLY and month YYYY-MM.
+    # It must run selected full month, not fallback to daily/latest date.
+    if mode in monthly_modes or payload.get("month"):
+        month_text = str(payload.get("month") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}$", month_text):
+            raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
 
-# ===== OPTION KING AI PATCH: LOCAL LEARNING RISK FILTER =====
-# Version: 2026.05.28-local-learning-risk-1
+        summary, report = run_mobile_monthly_backtest(payload, mode, start_capital)
 
-SERVER_VERSION = "2026.05.28-local-learning-risk-1"
+        if month_text not in str(summary) and month_text not in str(report):
+            raise RuntimeError(f"Monthly backtest failed: selected month {month_text} not found in report")
 
-_OKAI_LOCAL_LEARNING_BASE_BUILD_TRADE_QUALITY = _okai_build_trade_quality
-_OKAI_LOCAL_LEARNING_BASE_STATUS_PAYLOAD = status_payload
-_OKAI_LOCAL_LEARNING_BASE_BUILD_SETTINGS_TEXT = build_settings_text
+        wrong_daily = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", str(report))
+        if wrong_daily and not wrong_daily.group(1).startswith(month_text):
+            raise RuntimeError(f"Monthly backtest returned date outside selected month: {wrong_daily.group(1)}")
 
-local_learning_runtime = {
-    "last_refresh": 0.0,
-    "summary": "Local learning waiting for trade history",
-    "rules": {},
-    "sample": 0,
-}
+        return summary, report
+
+    day = parse_backtest_day(payload.get("date"))
+    result = run_mobile_backtest_day(mode, day, start_capital)
+    return result["summary"], result["report"]
 
 
 def _okai_learning_trade_pnl(row):
@@ -22852,20 +22921,45 @@ def run_mobile_monthly_backtest(payload, mode, start_capital):
 
 def run_mobile_backtest(payload=None):
     payload = payload or {}
-    mode = str(payload.get("mode", "FAST") or "FAST").upper()
-    start_capital = _okai_fix_float(payload.get("capital") or paper_capital or capital, 50000)
-    if mode in {"MONTH", "MONTHLY"}:
-        return run_mobile_monthly_backtest(payload, "MONTHLY", start_capital)
+
+    raw_mode = payload.get("mode") or payload.get("type") or payload.get("backtest_mode") or "FAST"
+    mode = str(raw_mode or "FAST").upper().replace("-", "_").replace(" ", "_")
+
+    start_capital = float(payload.get("capital") or paper_capital or capital)
+
+    if mode in ("REPLAY", "ACTUAL", "ACTUAL_REPLAY", "ACTUALREPLAY", "REAL_TRADE_REPLAY"):
+        return run_actual_trade_replay_backtest(payload)
+
+    monthly_modes = {
+        "MONTH",
+        "MONTHLY",
+        "REALISTIC_MONTHLY",
+        "AI_REALISTIC_MONTHLY",
+        "MONTH_REAL",
+        "REAL_MONTH",
+        "REAL_MONTHLY",
+    }
+
+    # Mobile Month (Real) sends mode REALISTIC_MONTHLY and month YYYY-MM.
+    # It must run selected full month, not fallback to daily/latest date.
+    if mode in monthly_modes or payload.get("month"):
+        month_text = str(payload.get("month") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}$", month_text):
+            raise RuntimeError("Monthly backtest requires month in YYYY-MM format")
+
+        summary, report = run_mobile_monthly_backtest(payload, mode, start_capital)
+
+        if month_text not in str(summary) and month_text not in str(report):
+            raise RuntimeError(f"Monthly backtest failed: selected month {month_text} not found in report")
+
+        wrong_daily = re.search(r"Date:\s*(\d{4}-\d{2}-\d{2})", str(report))
+        if wrong_daily and not wrong_daily.group(1).startswith(month_text):
+            raise RuntimeError(f"Monthly backtest returned date outside selected month: {wrong_daily.group(1)}")
+
+        return summary, report
+
     day = parse_backtest_day(payload.get("date"))
     result = run_mobile_backtest_day(mode, day, start_capital)
-    _OKAI_FIX_LAST_BACKTEST_DETAILS.clear()
-    _OKAI_FIX_LAST_BACKTEST_DETAILS.update(json_safe({
-        "mode": mode,
-        "start_day": day.strftime("%Y-%m-%d"),
-        "end_day": day.strftime("%Y-%m-%d"),
-        "day_results": [{"day_stats": result.get("day_stats"), "summary": result.get("summary")}],
-        "skipped": [],
-    }))
     return result["summary"], result["report"]
 
 
@@ -24883,6 +24977,64 @@ except Exception:
     print("[BT-CONFIG v2026.07.05] Loaded: auto restore Angel config before backtest")
 
 # ===== END AUTO RESTORE ANGEL CONFIG BEFORE BACKTEST =====
+
+
+
+
+# OKAI MODE CONSISTENCY FINAL V1 START
+def trade_mode():
+    try:
+        mode = str(config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER").strip().upper()
+    except Exception:
+        mode = "PAPER"
+    return "LIVE" if mode == "LIVE" else "PAPER"
+
+def live_trading_enabled():
+    try:
+        return bool(config.get("live_trading_enabled", False)) and trade_mode() == "LIVE"
+    except Exception:
+        return False
+
+def is_live_mode():
+    return trade_mode() == "LIVE" and live_trading_enabled()
+
+def set_trade_mode(mode=None, live_enabled=None):
+    mode_text = str(mode or config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER").strip().upper()
+    if mode_text not in ("PAPER", "LIVE"):
+        mode_text = "PAPER"
+
+    config["trade_mode"] = mode_text
+    config["mode"] = mode_text
+
+    if mode_text == "PAPER":
+        config["live_trading_enabled"] = False
+        config["paper_disabled"] = False
+    else:
+        config["live_trading_enabled"] = bool(live_enabled)
+        config["paper_disabled"] = False
+
+    globals()["LIVE_TRADING"] = bool(config.get("trade_mode") == "LIVE" and config.get("live_trading_enabled"))
+
+    try:
+        save_config()
+    except Exception:
+        pass
+
+    try:
+        gui_log(
+            f"MODE SWITCH FINAL | mode={config.get('trade_mode')} | "
+            f"live_enabled={bool(config.get('live_trading_enabled'))} | "
+            f"paper_disabled={bool(config.get('paper_disabled', False))}"
+        )
+    except Exception:
+        pass
+
+    return {
+        "trade_mode": trade_mode(),
+        "live_trading_enabled": live_trading_enabled(),
+        "paper_disabled": bool(config.get("paper_disabled", False)),
+    }
+# OKAI MODE CONSISTENCY FINAL V1 END
 
 
 if __name__ == "__main__":
