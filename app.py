@@ -4650,7 +4650,13 @@ class Handler(BaseHTTPRequestHandler):
             raise
 
     def authorized(self):
-        return self.headers.get("X-Api-Token", "") == api_token()
+        try:
+            clean_path = (self.path or "").split("?", 1)[0]
+            if clean_path in ("/phone_server_update.json", "/mobile_app_update.json", "/update.json"):
+                return True
+        except Exception:
+            pass
+        return self.headers.get("X-Api-Token", "") == api_token()  # OKAI PUBLIC UPDATE ENDPOINT V1
 
     def read_body(self):
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -25035,6 +25041,90 @@ def set_trade_mode(mode=None, live_enabled=None):
         "paper_disabled": bool(config.get("paper_disabled", False)),
     }
 # OKAI MODE CONSISTENCY FINAL V1 END
+
+
+
+
+# OKAI AUTO UPDATE AUTH V1 START
+def _okai_auto_update_urlopen(url, timeout=8):
+    import urllib.request
+    headers = {}
+    try:
+        tok = api_token()
+        if tok:
+            headers["X-Api-Token"] = str(tok)
+    except Exception:
+        pass
+    req = urllib.request.Request(url, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+# OKAI AUTO UPDATE AUTH V1 END
+
+
+
+
+# OKAI PHONE UPDATE ROUTE V1 START
+try:
+    _OKAI_PHONE_UPDATE_BASE_DO_GET = Handler.do_GET
+
+    def _okai_phone_update_do_GET(self):
+        clean_path = (getattr(self, "path", "") or "").split("?", 1)[0]
+
+        if clean_path in ("/phone_server_update.json", "/mobile_app_update.json", "/update.json"):
+            import json as _json
+            import time as _time
+
+            try:
+                ver = str(
+                    config.get("server_version")
+                    or config.get("app_version")
+                    or config.get("version")
+                    or "okai-mobile"
+                )
+            except Exception:
+                ver = "okai-mobile"
+
+            payload = {
+                "ok": True,
+                "success": True,
+                "update_available": False,
+                "server_reachable": True,
+                "version": ver,
+                "server_version": ver,
+                "message": "OKAI mobile update endpoint OK",
+                "timestamp": int(_time.time()),
+                "data": {
+                    "update_available": False,
+                    "version": ver,
+                    "server_reachable": True
+                }
+            }
+
+            body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Api-Token")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        return _OKAI_PHONE_UPDATE_BASE_DO_GET(self)
+
+    Handler.do_GET = _okai_phone_update_do_GET
+
+    try:
+        gui_log("OKAI PHONE UPDATE ROUTE V1 active")
+    except Exception:
+        pass
+
+except Exception as _e:
+    try:
+        gui_log(f"OKAI PHONE UPDATE ROUTE V1 skipped: {_e}")
+    except Exception:
+        pass
+# OKAI PHONE UPDATE ROUTE V1 END
 
 
 if __name__ == "__main__":
