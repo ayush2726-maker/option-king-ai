@@ -25250,6 +25250,41 @@ def status_payload():
 # OKAI SAFE STATUS FALLBACK V1 END
 
 
+
+
+# OKAI MOBILE LOG CLEANUP V1 START
+try:
+    _OKAI_LOG_CLEANUP_BASE_GUI_LOG = gui_log
+
+    def gui_log(message):
+        try:
+            msg = str(message or "")
+
+            # App auto-refresh ke time ye fallback baar-baar spam na kare
+            if msg.startswith("SAFE STATUS FALLBACK used:"):
+                return
+
+            # PAPER mode me Angel capital skip normal hai, isliye spam hide
+            if "Angel capital auto-sync skipped" in msg and "MODE=PAPER" in msg:
+                return
+
+            return _OKAI_LOG_CLEANUP_BASE_GUI_LOG(message)
+        except Exception:
+            try:
+                return _OKAI_LOG_CLEANUP_BASE_GUI_LOG(message)
+            except Exception:
+                pass
+
+    try:
+        _OKAI_LOG_CLEANUP_BASE_GUI_LOG("OKAI MOBILE LOG CLEANUP V1 active")
+    except Exception:
+        pass
+
+except Exception:
+    pass
+# OKAI MOBILE LOG CLEANUP V1 END
+
+
 if __name__ == "__main__":
     main()
 
