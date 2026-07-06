@@ -340,12 +340,44 @@ class WorkerManager:
             log_file = open(log_path, "a", encoding="utf-8")
             log_file.write(f"\n\n--- worker start {now_text()} ---\n")
             log_file.flush()
+            # OKAI WORKER CONFIG TOKEN SYNC V1
+            try:
+                cfg_path = os.path.join(str(self.user_dir(user_id)), "config.json")
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as _fh:
+                        cfg_data = json.load(_fh)
+                except Exception:
+                    cfg_data = {}
+
+                user_token = str(user.get("token") or "")
+                if user_token:
+                    cfg_data["api_token"] = user_token
+                    cfg_data["mobile_api_token"] = user_token
+                    cfg_data["server_api_token"] = user_token
+
+                cfg_data["port"] = int(user.get("port") or DEFAULT_WORKER_PORT)
+                cfg_data["host"] = "127.0.0.1"
+
+                with open(cfg_path, "w", encoding="utf-8") as _fh:
+                    json.dump(cfg_data, _fh, indent=2)
+
+                log(f"Worker {user_id} config token synced")
+            except Exception as exc:
+                log(f"Worker {user_id} config token sync skipped: {exc}")
+
+            worker_env = os.environ.copy()  # OKAI WORKER PORT ENV V1
+            worker_env["PORT"] = str(user.get("port") or DEFAULT_WORKER_PORT)
+            worker_env["OPTIONKING_USER_ID"] = user_id
+            worker_env["OPTIONKING_USER_TOKEN"] = str(user.get("token") or "")
+            worker_env["PYTHONUNBUFFERED"] = "1"
+
             proc = subprocess.Popen(
                 [sys.executable, self.worker_app_path(user_id)],
                 cwd=self.user_dir(user_id),
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                env=worker_env,
             )
             self.processes[user_id] = proc
             log(f"Worker {user_id} started on 127.0.0.1:{user['port']}")
