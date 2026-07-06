@@ -700,5 +700,48 @@ def main() -> None:
     run_server()
 
 
+
+
+# OKAI GATEWAY PUBLIC UPDATE V1 START
+try:
+    _OKAI_GATEWAY_BASE_DO_GET = GatewayHandler.do_GET
+
+    def _okai_gateway_public_update_do_GET(self):
+        try:
+            from urllib.parse import urlparse as _urlparse
+            import time as _time
+            path = _urlparse(getattr(self, "path", "") or "").path
+
+            if path in ("/phone_server_update.json", "/mobile_app_update.json", "/update.json"):
+                self.send_json({
+                    "ok": True,
+                    "success": True,
+                    "update_available": False,
+                    "server_reachable": True,
+                    "version": "okai-mobile",
+                    "server_version": "okai-mobile",
+                    "message": "OKAI gateway update endpoint OK",
+                    "timestamp": int(_time.time()),
+                    "sha256": "0" * 64,
+                    "checksum": "0" * 64,
+                    "data": {
+                        "update_available": False,
+                        "server_reachable": True,
+                        "version": "okai-mobile",
+                        "sha256": "0" * 64,
+                    }
+                })
+                return
+        except Exception:
+            pass
+
+        return _OKAI_GATEWAY_BASE_DO_GET(self)
+
+    GatewayHandler.do_GET = _okai_gateway_public_update_do_GET
+except Exception:
+    pass
+# OKAI GATEWAY PUBLIC UPDATE V1 END
+
+
 if __name__ == "__main__":
     main()

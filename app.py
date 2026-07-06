@@ -25201,6 +25201,55 @@ def api_token():
 # OKAI API TOKEN ENV FALLBACK V1 END
 
 
+
+
+# OKAI SAFE STATUS FALLBACK V1 START
+try:
+    _OKAI_SAFE_STATUS_BASE_PAYLOAD = status_payload
+except Exception:
+    _OKAI_SAFE_STATUS_BASE_PAYLOAD = None
+
+def status_payload():
+    try:
+        if _OKAI_SAFE_STATUS_BASE_PAYLOAD:
+            return _OKAI_SAFE_STATUS_BASE_PAYLOAD()
+    except Exception as _e:
+        try:
+            gui_log(f"SAFE STATUS FALLBACK used: {_e}")
+        except Exception:
+            pass
+
+    try:
+        _mode = trade_mode()
+    except Exception:
+        _mode = str(config.get("trade_mode", config.get("mode", "PAPER")) or "PAPER").upper()
+
+    try:
+        _live = live_trading_enabled()
+    except Exception:
+        _live = bool(config.get("live_trading_enabled", False)) and _mode == "LIVE"
+
+    return {
+        "server_version": str(config.get("server_version") or config.get("version") or "okai-mobile"),
+        "running": True,
+        "mode": _mode,
+        "trade_mode": _mode,
+        "live_trading_enabled": bool(_live),
+        "paper_disabled": bool(config.get("paper_disabled", False)),
+        "capital": float(globals().get("capital", config.get("capital", 0)) or 0),
+        "paper_capital": float(config.get("paper_capital", globals().get("capital", 0)) or 0),
+        "daily_pnl": float(globals().get("daily_pnl", 0) or 0),
+        "closed_trades": len(globals().get("trade_history", []) or []),
+        "trade_count": len(globals().get("trade_history", []) or []),
+        "websocket_status": globals().get("websocket_status", "unknown"),
+        "chart_count": len(globals().get("last_chart_rows", []) or []),
+        "chart_message": "Safe status fallback active",
+        "api_token": "SET" if api_token() else "MISSING",
+        "okai_safe_status_fallback": True,
+    }
+# OKAI SAFE STATUS FALLBACK V1 END
+
+
 if __name__ == "__main__":
     main()
 
