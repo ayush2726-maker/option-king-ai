@@ -25285,6 +25285,134 @@ except Exception:
 # OKAI MOBILE LOG CLEANUP V1 END
 
 
+
+
+# OKAI ANGEL CONFIG PRESERVE V1 START
+def _okai_preserve_angel_config_keys():
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+
+        global config
+
+        _need = ["api_key", "client_id", "password", "totp_secret"]
+
+        # Agar current config me already Angel keys hain to kuch mat karo
+        if all(str((config or {}).get(k) or "").strip() for k in _need):
+            return False
+
+        _base = _Path(__file__).resolve().parent
+        _cwd = _Path.cwd()
+
+        _candidates = [
+            _base / "config_backup.json",
+            _base / "config_before_tqu_fix.json",
+            _base / "config_before_capital_fix.json",
+            _base / "config_update_localhost_20260706_080941.json",
+            _cwd / "config_backup.json",
+            _cwd / "config_before_tqu_fix.json",
+            _cwd / "config_before_capital_fix.json",
+            _cwd / "users" / "owner" / "config_backup.json",
+            _cwd / "users" / "owner" / "config_before_tqu_fix.json",
+            _cwd / "users" / "owner" / "config_before_capital_fix.json",
+        ]
+
+        _best = None
+        for _p in _candidates:
+            try:
+                if not _p.exists():
+                    continue
+                _d = _json.loads(_p.read_text(encoding="utf-8"))
+                if all(str(_d.get(k) or "").strip() for k in _need):
+                    _best = (_p, _d)
+                    break
+            except Exception:
+                pass
+
+        if not _best:
+            return False
+
+        _p, _d = _best
+
+        for _k in _need:
+            config[_k] = _d[_k]
+
+        config["client_code"] = config.get("client_id", "")
+        config["pin"] = config.get("password", "")
+
+        # Gateway token/port preserve
+        if str(__file__).replace("\\", "/").endswith("/users/owner/app.py"):
+            config["api_token"] = "optionking-local"
+            config["mobile_api_token"] = "optionking-local"
+            config["server_api_token"] = "optionking-local"
+            config["token"] = "optionking-local"
+            config["host"] = "127.0.0.1"
+            config["port"] = 18765
+
+        # Active config.json me bhi write-back karo
+        for _target in [_base / "config.json", _cwd / "config.json"]:
+            try:
+                if _target.exists():
+                    try:
+                        _cur = _json.loads(_target.read_text(encoding="utf-8"))
+                    except Exception:
+                        _cur = {}
+                    for _k in ["api_key", "client_id", "password", "totp_secret", "client_code", "pin"]:
+                        _cur[_k] = config.get(_k, "")
+                    if str(__file__).replace("\\", "/").endswith("/users/owner/app.py"):
+                        _cur["api_token"] = "optionking-local"
+                        _cur["mobile_api_token"] = "optionking-local"
+                        _cur["server_api_token"] = "optionking-local"
+                        _cur["token"] = "optionking-local"
+                        _cur["host"] = "127.0.0.1"
+                        _cur["port"] = 18765
+                    _target.write_text(_json.dumps(_cur, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+        try:
+            gui_log(f"OKAI ANGEL CONFIG PRESERVE V1 restored from {_p}")
+        except Exception:
+            pass
+
+        return True
+
+    except Exception:
+        return False
+
+
+try:
+    _OKAI_ANGEL_PRESERVE_BASE_LOAD_CONFIG = load_config
+
+    def load_config():
+        _r = _OKAI_ANGEL_PRESERVE_BASE_LOAD_CONFIG()
+        _okai_preserve_angel_config_keys()
+        return _r
+except Exception:
+    pass
+
+
+try:
+    _OKAI_ANGEL_PRESERVE_BASE_SAVE_CONFIG = save_config
+
+    def save_config():
+        _okai_preserve_angel_config_keys()
+        return _OKAI_ANGEL_PRESERVE_BASE_SAVE_CONFIG()
+except Exception:
+    pass
+
+
+try:
+    _OKAI_ANGEL_PRESERVE_BASE_SAVE_CLOUD_CONFIG = save_cloud_config
+
+    def save_cloud_config():
+        _okai_preserve_angel_config_keys()
+        return _OKAI_ANGEL_PRESERVE_BASE_SAVE_CLOUD_CONFIG()
+except Exception:
+    pass
+# OKAI ANGEL CONFIG PRESERVE V1 END
+
+
 if __name__ == "__main__":
     main()
 
