@@ -3940,8 +3940,36 @@ def run_mobile_backtest_day(mode, day, start_capital):
             except Exception:
                 _bt_min_score = 78
 
+            # === OKAI BT MIN SCORE 82 V1 START ===
             try:
-                _bt_score_now = int(float(config.get('entry_score', config.get('score_threshold', 78)) or 78))
+                _bt_min_score = max(int(float(_bt_min_score or 0)), 82)
+            except Exception:
+                _bt_min_score = 82
+            # === OKAI BT MIN SCORE 82 V1 END ===
+
+            try:
+                _bt_score_now = 0
+                _score_candidates = [
+                    locals().get('score'),
+                    locals().get('weighted_score'),
+                    locals().get('final_score'),
+                ]
+
+                for _obj_name in ('setup', 'quality', 'trade_quality', 'signal_quality', 'ai_quality'):
+                    try:
+                        _obj = locals().get(_obj_name)
+                        if isinstance(_obj, dict):
+                            _score_candidates.append(_obj.get('score'))
+                            _score_candidates.append(_obj.get('weighted_score'))
+                    except Exception:
+                        pass
+
+                for _sv in _score_candidates:
+                    try:
+                        if _sv is not None:
+                            _bt_score_now = max(_bt_score_now, int(float(_sv or 0)))
+                    except Exception:
+                        pass
             except Exception:
                 _bt_score_now = 0
 
@@ -3951,6 +3979,98 @@ def run_mobile_backtest_day(mode, day, start_capital):
                 except Exception:
                     pass
                 continue
+
+            # === OKAI BT WRONG DIRECTION GATE V1 START ===
+            # Downtrend me low/normal score CE block, uptrend me low/normal score PE block.
+            # Reversal sirf very high score par allow.
+            try:
+                _bt_dir_block = False
+                _bt_dir_reason = ""
+
+                _df = locals().get("df")
+                _idx = locals().get("index", locals().get("i", None))
+
+                if _df is not None and hasattr(_df, "iloc") and len(_df) > 5:
+                    try:
+                        _idx_int = int(_idx) if _idx is not None else len(_df) - 1
+                    except Exception:
+                        _idx_int = len(_df) - 1
+
+                    if _idx_int < 0:
+                        _idx_int = len(_df) + _idx_int
+                    _idx_int = max(0, min(_idx_int, len(_df) - 1))
+
+                    _row = _df.iloc[_idx_int]
+                    _prev = _df.iloc[max(0, _idx_int - 5)]
+
+                    def _val(_r, *names):
+                        for _name in names:
+                            try:
+                                if _name in _r and _r[_name] is not None:
+                                    return float(_r[_name])
+                            except Exception:
+                                pass
+                        return None
+
+                    _close = _val(_row, "close", "Close", "ltp", "price")
+                    _prev_close = _val(_prev, "close", "Close", "ltp", "price")
+                    _vwap = _val(_row, "vwap", "VWAP")
+                    _ema9 = _val(_row, "ema9", "EMA9", "ema_9")
+                    _ema21 = _val(_row, "ema21", "EMA21", "ema_21")
+                    _ema20 = _val(_row, "ema20", "EMA20", "ema_20")
+                    _ema50 = _val(_row, "ema50", "EMA50", "ema_50")
+
+                    _bear_votes = 0
+                    _bull_votes = 0
+
+                    if _close is not None and _vwap is not None:
+                        if _close < _vwap:
+                            _bear_votes += 1
+                        elif _close > _vwap:
+                            _bull_votes += 1
+
+                    if _ema9 is not None and _ema21 is not None:
+                        if _ema9 < _ema21:
+                            _bear_votes += 1
+                        elif _ema9 > _ema21:
+                            _bull_votes += 1
+
+                    if _ema20 is not None and _ema50 is not None:
+                        if _ema20 < _ema50:
+                            _bear_votes += 1
+                        elif _ema20 > _ema50:
+                            _bull_votes += 1
+
+                    if _close is not None and _prev_close is not None:
+                        if _close < _prev_close:
+                            _bear_votes += 1
+                        elif _close > _prev_close:
+                            _bull_votes += 1
+
+                    _sig = str(signal or "").upper()
+                    _reversal_min = 85
+
+                    if _sig == "CE" and _bear_votes >= 3 and _bt_score_now < _reversal_min:
+                        _bt_dir_block = True
+                        _bt_dir_reason = f"BT DIRECTION BLOCK: CE blocked in bearish trend | bear={_bear_votes} bull={_bull_votes} score={_bt_score_now}<{_reversal_min}"
+
+                    if _sig == "PE" and _bull_votes >= 3 and _bt_score_now < _reversal_min:
+                        _bt_dir_block = True
+                        _bt_dir_reason = f"BT DIRECTION BLOCK: PE blocked in bullish trend | bull={_bull_votes} bear={_bear_votes} score={_bt_score_now}<{_reversal_min}"
+
+                if _bt_dir_block:
+                    try:
+                        gui_log(f"{okai_bt_dt_text(locals())} | {_bt_dir_reason}")
+                    except Exception:
+                        pass
+                    continue
+            except Exception as _e:
+                try:
+                    gui_log(f"BT DIRECTION GATE skipped: {str(_e)[:80]}")
+                except Exception:
+                    pass
+            # === OKAI BT WRONG DIRECTION GATE V1 END ===
+
             position_bt = {
                 "signal": signal,
                 "trade_type": trade_type,
@@ -6228,8 +6348,36 @@ def run_realistic_backtest_day(mode, day, start_capital):
             except Exception:
                 _bt_min_score = 78
 
+            # === OKAI BT MIN SCORE 82 V1 START ===
             try:
-                _bt_score_now = int(float(config.get('entry_score', config.get('score_threshold', 78)) or 78))
+                _bt_min_score = max(int(float(_bt_min_score or 0)), 82)
+            except Exception:
+                _bt_min_score = 82
+            # === OKAI BT MIN SCORE 82 V1 END ===
+
+            try:
+                _bt_score_now = 0
+                _score_candidates = [
+                    locals().get('score'),
+                    locals().get('weighted_score'),
+                    locals().get('final_score'),
+                ]
+
+                for _obj_name in ('setup', 'quality', 'trade_quality', 'signal_quality', 'ai_quality'):
+                    try:
+                        _obj = locals().get(_obj_name)
+                        if isinstance(_obj, dict):
+                            _score_candidates.append(_obj.get('score'))
+                            _score_candidates.append(_obj.get('weighted_score'))
+                    except Exception:
+                        pass
+
+                for _sv in _score_candidates:
+                    try:
+                        if _sv is not None:
+                            _bt_score_now = max(_bt_score_now, int(float(_sv or 0)))
+                    except Exception:
+                        pass
             except Exception:
                 _bt_score_now = 0
 
@@ -6239,6 +6387,98 @@ def run_realistic_backtest_day(mode, day, start_capital):
                 except Exception:
                     pass
                 continue
+
+            # === OKAI BT WRONG DIRECTION GATE V1 START ===
+            # Downtrend me low/normal score CE block, uptrend me low/normal score PE block.
+            # Reversal sirf very high score par allow.
+            try:
+                _bt_dir_block = False
+                _bt_dir_reason = ""
+
+                _df = locals().get("df")
+                _idx = locals().get("index", locals().get("i", None))
+
+                if _df is not None and hasattr(_df, "iloc") and len(_df) > 5:
+                    try:
+                        _idx_int = int(_idx) if _idx is not None else len(_df) - 1
+                    except Exception:
+                        _idx_int = len(_df) - 1
+
+                    if _idx_int < 0:
+                        _idx_int = len(_df) + _idx_int
+                    _idx_int = max(0, min(_idx_int, len(_df) - 1))
+
+                    _row = _df.iloc[_idx_int]
+                    _prev = _df.iloc[max(0, _idx_int - 5)]
+
+                    def _val(_r, *names):
+                        for _name in names:
+                            try:
+                                if _name in _r and _r[_name] is not None:
+                                    return float(_r[_name])
+                            except Exception:
+                                pass
+                        return None
+
+                    _close = _val(_row, "close", "Close", "ltp", "price")
+                    _prev_close = _val(_prev, "close", "Close", "ltp", "price")
+                    _vwap = _val(_row, "vwap", "VWAP")
+                    _ema9 = _val(_row, "ema9", "EMA9", "ema_9")
+                    _ema21 = _val(_row, "ema21", "EMA21", "ema_21")
+                    _ema20 = _val(_row, "ema20", "EMA20", "ema_20")
+                    _ema50 = _val(_row, "ema50", "EMA50", "ema_50")
+
+                    _bear_votes = 0
+                    _bull_votes = 0
+
+                    if _close is not None and _vwap is not None:
+                        if _close < _vwap:
+                            _bear_votes += 1
+                        elif _close > _vwap:
+                            _bull_votes += 1
+
+                    if _ema9 is not None and _ema21 is not None:
+                        if _ema9 < _ema21:
+                            _bear_votes += 1
+                        elif _ema9 > _ema21:
+                            _bull_votes += 1
+
+                    if _ema20 is not None and _ema50 is not None:
+                        if _ema20 < _ema50:
+                            _bear_votes += 1
+                        elif _ema20 > _ema50:
+                            _bull_votes += 1
+
+                    if _close is not None and _prev_close is not None:
+                        if _close < _prev_close:
+                            _bear_votes += 1
+                        elif _close > _prev_close:
+                            _bull_votes += 1
+
+                    _sig = str(signal or "").upper()
+                    _reversal_min = 85
+
+                    if _sig == "CE" and _bear_votes >= 3 and _bt_score_now < _reversal_min:
+                        _bt_dir_block = True
+                        _bt_dir_reason = f"BT DIRECTION BLOCK: CE blocked in bearish trend | bear={_bear_votes} bull={_bull_votes} score={_bt_score_now}<{_reversal_min}"
+
+                    if _sig == "PE" and _bull_votes >= 3 and _bt_score_now < _reversal_min:
+                        _bt_dir_block = True
+                        _bt_dir_reason = f"BT DIRECTION BLOCK: PE blocked in bullish trend | bull={_bull_votes} bear={_bear_votes} score={_bt_score_now}<{_reversal_min}"
+
+                if _bt_dir_block:
+                    try:
+                        gui_log(f"{okai_bt_dt_text(locals())} | {_bt_dir_reason}")
+                    except Exception:
+                        pass
+                    continue
+            except Exception as _e:
+                try:
+                    gui_log(f"BT DIRECTION GATE skipped: {str(_e)[:80]}")
+                except Exception:
+                    pass
+            # === OKAI BT WRONG DIRECTION GATE V1 END ===
+
             position_bt = {
                 "signal": signal,
                 "trade_type": trade_type,
@@ -21848,11 +22088,145 @@ def _tqu_sideways_check(setup):
 
     score = float(setup.get("score", 0) or 0)
     weighted_score = float(setup.get("weighted_score", setup.get("score", 0)) or 0)
-    core_score = float(setup.get("core_score", 0) or 0)        # 0..5 typically
+    # === OKAI TQU CORE SCORE RECALC V1 START ===
+    # core_score missing/0 aa raha tha, isliye weighted components se actual 0..5 core recalc.
+    def _tqu_comp_score(_name):
+        try:
+            _containers = [
+                setup.get("components"),
+                setup.get("component_scores"),
+                setup.get("scores"),
+                setup,
+            ]
+            for _c in _containers:
+                if not isinstance(_c, dict):
+                    continue
+                _v = _c.get(_name)
+                if isinstance(_v, dict):
+                    return float(_v.get("score", 0) or 0)
+                if _v is not None and not isinstance(_v, (list, tuple)):
+                    try:
+                        return float(_v or 0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return 0.0
+
+    def _tqu_recalc_core_score():
+        vwap = _tqu_comp_score("vwap_alignment")
+        ema = _tqu_comp_score("ema_alignment")
+        adx = _tqu_comp_score("adx_strength")
+        atr = _tqu_comp_score("atr_volatility")
+        candle = _tqu_comp_score("strong_candle_close")
+        orb = _tqu_comp_score("orb_breakout")
+        chain = _tqu_comp_score("option_chain_support")
+        oi = _tqu_comp_score("oi_buildup")
+        volume = _tqu_comp_score("volume_spike")
+
+        parts = []
+
+        if vwap >= 8:
+            parts.append("VWAP")
+        if ema >= 8:
+            parts.append("EMA")
+        if adx >= 7 or atr >= 6:
+            parts.append("ADX_ATR")
+        if candle >= 5 or orb >= 4:
+            parts.append("MOMENTUM")
+        if chain >= 6 or oi >= 4 or volume >= 6:
+            parts.append("SUPPORT")
+
+        return min(5, len(parts)), parts, {
+            "vwap": vwap,
+            "ema": ema,
+            "adx": adx,
+            "atr": atr,
+            "candle": candle,
+            "orb": orb,
+            "chain": chain,
+            "oi": oi,
+            "volume": volume,
+        }
+
+    try:
+        _existing_core = float(setup.get("core_score", 0) or 0)
+    except Exception:
+        _existing_core = 0.0
+
+    _calc_core, _core_parts, _core_raw = _tqu_recalc_core_score()
+    core_score = max(_existing_core, float(_calc_core))
+    setup["core_score"] = core_score
+    setup["core_parts"] = _core_parts
+    setup["core_raw_scores"] = _core_raw
+
+    try:
+        if (score >= 78 or weighted_score >= 78) and core_score > _existing_core:
+            gui_log(
+                "TQU CORE RECALC | "
+                f"core={core_score:.0f}/5 | parts={'+'.join(_core_parts) or 'NONE'} | "
+                f"vwap={_core_raw.get('vwap'):.0f} ema={_core_raw.get('ema'):.0f} "
+                f"adx={_core_raw.get('adx'):.0f} atr={_core_raw.get('atr'):.0f} "
+                f"candle={_core_raw.get('candle'):.0f} orb={_core_raw.get('orb'):.0f} "
+                f"chain={_core_raw.get('chain'):.0f} oi={_core_raw.get('oi'):.0f} "
+                f"vol={_core_raw.get('volume'):.0f}"
+            )
+    except Exception:
+        pass
+    # === OKAI TQU CORE SCORE RECALC V1 END ===
     min_score = _tqu_sideways_min_score()                      # default 68 now
     vol_spike = float(setup.get("volume_spike", {}).get("score", 0) or 0) if isinstance(setup.get("volume_spike"), dict) else 0
     vol_ratio = float(setup.get("volume_ratio", 1.0) or 1.0)
     min_vol   = _okai_config_float("tqu_sideways_min_vol_ratio", 1.2, 0.8, 3.0)
+    # === OKAI PAPER SIDEWAYS BYPASS V1 START ===
+    # PAPER-only: strong score ko sideways/volume/core ke chakkar me miss na kare.
+    # REAL/LIVE mode me strict safety same rahegi.
+    try:
+        _paper_vals = []
+        for _k in ("trade_mode", "TRADE_MODE", "mode", "MODE", "RUN_MODE", "CURRENT_MODE"):
+            try:
+                _paper_vals.append(globals().get(_k))
+            except Exception:
+                pass
+
+        try:
+            _cfg = globals().get("config")
+            if isinstance(_cfg, dict):
+                _paper_vals.append(_cfg.get("trade_mode"))
+                _paper_vals.append(_cfg.get("mode"))
+        except Exception:
+            pass
+
+        _is_paper = any(str(v or "").upper() == "PAPER" for v in _paper_vals)
+
+        _live_vals = []
+        for _k in ("live_trading_enabled", "LIVE_TRADING_ENABLED", "real_trading_enabled", "REAL_TRADING_ENABLED", "live_enabled"):
+            try:
+                _live_vals.append(globals().get(_k))
+            except Exception:
+                pass
+
+        _live_on = any(str(v).lower() in ("true", "1", "yes", "on") for v in _live_vals)
+
+        _paper_bypass_enabled = bool(_okai_config_float("paper_sideways_bypass_enabled", 0, 0, 1))
+        _paper_bypass_score = _okai_config_float("paper_sideways_bypass_score", 82, 78, 95)
+
+        if _paper_bypass_enabled and _is_paper and not _live_on and score >= _paper_bypass_score and weighted_score >= 78:
+            setup["paper_sideways_bypass"] = True
+            setup.setdefault("modifiers", []).append(
+                f"PAPER SIDEWAYS BYPASS: score={score:.0f}, weighted={weighted_score:.0f}, vol={vol_ratio:.1f}x, core={core_score:.0f}/5"
+            )
+            return True, (
+                f"PAPER SIDEWAYS BYPASS allowed: score={score:.0f}>={_paper_bypass_score:.0f}, "
+                f"weighted={weighted_score:.0f}, vol={vol_ratio:.1f}x, core={core_score:.0f}/5"
+            )
+    except Exception as _e:
+        try:
+            setup.setdefault("modifiers", []).append(f"PAPER SIDEWAYS BYPASS error ignored: {_e}")
+        except Exception:
+            pass
+    # === OKAI PAPER SIDEWAYS BYPASS V1 END ===
+
 
     # Strong path — score above min + vol confirmation
     if score > min_score and (vol_spike >= 6 or vol_ratio >= min_vol):
@@ -26006,9 +26380,9 @@ try:
             "daily_loss_limit_percent": 100,
             "disable_daily_loss_limit": True,
 
-            "entry_score": 78,
-            "min_entry_score": 78,
-            "score_threshold": 78,
+            "entry_score": 82,
+            "min_entry_score": 82,
+            "score_threshold": 82,
 
             "max_capital_use_percent": 90,
             "capital_use_percent": 90,
@@ -26017,7 +26391,7 @@ try:
             "sl_percent": 10,
             "target_percent": 20,
 
-            "max_trades_per_day": 2,
+            "max_trades_per_day": 10,
 
             "gemini_required": False,
             "require_gemini_approval": False,
@@ -26026,7 +26400,7 @@ try:
     except Exception:
         pass
 
-    print("OKAI DAILY LOSS OFF V1 active | daily_loss_limit=OFF | capital_use=90% | max_trades=2")
+    print("OKAI DAILY LOSS OFF V1 active | daily_loss_limit=OFF | capital_use=90% | max_trades=10")
 except Exception as _okai_daily_loss_off_err:
     try:
         print("OKAI DAILY LOSS OFF V1 failed:", _okai_daily_loss_off_err)
@@ -26221,14 +26595,14 @@ except Exception as _e:
 # === OKAI QUALITY FALLBACK V1 END ===
 
 
-# === OKAI FORCE SCORE78 QUALITY FIX V1 START ===
+# === OKAI FORCE SCORE82 QUALITY FIX V1 START ===
 try:
     # Backtest force settings
     try:
         config.update({
-            "entry_score": 78,
-            "min_entry_score": 78,
-            "score_threshold": 78,
+            "entry_score": 82,
+            "min_entry_score": 82,
+            "score_threshold": 82,
             "trade_score_required": 78,
             "min_score": 78,
 
@@ -26247,7 +26621,7 @@ try:
 
             "sl_percent": 10,
             "target_percent": 20,
-            "max_trades_per_day": 2,
+            "max_trades_per_day": 10,
         })
     except Exception:
         pass
@@ -26256,13 +26630,13 @@ try:
     def _OKAI_LOCAL_LEARNING_BASE_BUILD_TRADE_QUALITY(*args, **kwargs):
         return True, {"ok": True, "approved": True, "reason": "quality fallback approved", "score": 78, "confidence": 0}
 
-    print("OKAI FORCE SCORE78 QUALITY FIX V1 active | entry_score=78 | quality tuple fix | capital=90 | daily_loss=OFF")
+    print("OKAI FORCE SCORE82 QUALITY FIX V1 active | entry_score=82 | quality tuple fix | capital=90 | daily_loss=OFF")
 except Exception as _okai_force_score78_err:
     try:
-        print("OKAI FORCE SCORE78 QUALITY FIX V1 failed:", _okai_force_score78_err)
+        print("OKAI FORCE SCORE82 QUALITY FIX V1 failed:", _okai_force_score78_err)
     except Exception:
         pass
-# === OKAI FORCE SCORE78 QUALITY FIX V1 END ===
+# === OKAI FORCE SCORE82 QUALITY FIX V1 END ===
 
 
 
@@ -26519,15 +26893,15 @@ try:
                 pass
 
             # final fallback: candidate entry tak aa gaya hai, zero-score se block mat karo
-            return int(float(config.get("entry_score", config.get("score_threshold", 78)) or 78))
+            return int(float(config.get("entry_score", config.get("score_threshold", 82)) or 82))
         except Exception:
             return 78
 
     try:
         config.update({
-            "entry_score": 78,
-            "min_entry_score": 78,
-            "score_threshold": 78,
+            "entry_score": 82,
+            "min_entry_score": 82,
+            "score_threshold": 82,
             "trade_score_required": 78,
             "min_score": 78,
             "max_capital_use_percent": 90,
@@ -26538,7 +26912,7 @@ try:
             "gemini_required": False,
             "require_gemini_approval": False,
             "ai_approval_required": False,
-            "max_trades_per_day": 2,
+            "max_trades_per_day": 10,
         })
     except Exception:
         pass
@@ -27400,7 +27774,7 @@ try:
             # Agar candidate actual entry block tak aa gaya hai but score variable missing hai,
             # to 0 ki wajah se block mat karo. Config min score use karo.
             try:
-                return int(float(config.get("entry_score", config.get("score_threshold", 78)) or 78))
+                return int(float(config.get("entry_score", config.get("score_threshold", 82)) or 82))
             except Exception:
                 return 78
 
@@ -27409,9 +27783,9 @@ try:
 
     try:
         config.update({
-            "entry_score": 78,
-            "min_entry_score": 78,
-            "score_threshold": 78,
+            "entry_score": 82,
+            "min_entry_score": 82,
+            "score_threshold": 82,
             "trade_score_required": 78,
             "min_score": 78,
             "max_capital_use_percent": 90,
@@ -27422,12 +27796,12 @@ try:
             "gemini_required": False,
             "require_gemini_approval": False,
             "ai_approval_required": False,
-            "max_trades_per_day": 2,
+            "max_trades_per_day": 10,
         })
     except Exception:
         pass
 
-    print("OKAI BT QUALITY SCORE FINAL FIX V1 active | quality=dict tuple | score0 fallback=78")
+    print("OKAI BT QUALITY SCORE FINAL FIX V1 active | quality=dict tuple | score0 fallback=82")
 except Exception as _e:
     try:
         print("OKAI BT QUALITY SCORE FINAL FIX V1 failed:", _e)
@@ -27638,6 +28012,37 @@ except Exception as _e:
         pass
 # === OKAI ATR HYBRID SL TARGET V1 END ===
 
+
+
+
+# === OKAI ATR ENTRY DEBUG LOG V1 START ===
+try:
+    _OKAI_ATR_BASE_FUNC = okai_atr_sl_target
+
+    def okai_atr_sl_target(entry_price, df=None, candles=None, side="BUY", is_expiry=None):
+        res = _OKAI_ATR_BASE_FUNC(entry_price, df=df, candles=candles, side=side, is_expiry=is_expiry)
+        try:
+            msg = (
+                f"ATR_HYBRID CALC | entry={float(entry_price):.2f} | "
+                f"atr={res.get('atr')} | risk={res.get('risk_points')} | "
+                f"sl={res.get('sl')} | target={res.get('target')} | "
+                f"rr={res.get('rr')} | expiry={res.get('is_expiry')}"
+            )
+            if "gui_log" in globals():
+                gui_log(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
+        return res
+
+    print("OKAI ATR ENTRY DEBUG LOG V1 active")
+except Exception as _e:
+    try:
+        print("OKAI ATR ENTRY DEBUG LOG V1 failed:", _e)
+    except Exception:
+        pass
+# === OKAI ATR ENTRY DEBUG LOG V1 END ===
 
 
 # === OKAI ATR SL TARGET WIRING V1 START ===
