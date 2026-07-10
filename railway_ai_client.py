@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 DEFAULT_AI_URL = (
     "https://option-king-saas-production.up.railway.app/ai/predict"
 )
+DEFAULT_AI_KEY_FILE = os.path.join(os.path.expanduser("~"), ".okai_ai_key")
 
 
 def _load_personal_config() -> Dict[str, Any]:
@@ -45,6 +46,21 @@ def _load_personal_config() -> Dict[str, Any]:
     return {}
 
 
+def _load_ai_key_file() -> str:
+    """Read the Railway AI key from a local protected file.
+
+    The path can be overridden with OKAI_AI_KEY_FILE. The key is never logged.
+    This fallback keeps the personal client working even when app startup
+    restores config.json from an older Angel backup.
+    """
+    path = os.getenv("OKAI_AI_KEY_FILE", "").strip() or DEFAULT_AI_KEY_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except Exception:
+        return ""
+
+
 def _ai_settings():
     config = _load_personal_config()
     enabled = config.get("railway_ai_enabled", True)
@@ -54,6 +70,7 @@ def _ai_settings():
     api_key = (
         os.getenv("OKAI_AI_API_KEY", "").strip()
         or str(config.get("railway_ai_api_key") or config.get("ai_api_key") or "").strip()
+        or _load_ai_key_file()
     )
     url = (
         os.getenv("OKAI_AI_URL", "").strip()
