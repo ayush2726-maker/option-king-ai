@@ -20,11 +20,47 @@ DEFAULT_AI_URL = (
 )
 
 
-def _number(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _load_personal_config() -> Dict[str, Any]:
+    candidates = []
+    explicit = os.getenv("OKAI_CONFIG_PATH", "").strip()
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([
+        os.path.join(os.getcwd(), "config.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+    ])
+
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return {}
+
+
+def _ai_settings():
+    config = _load_personal_config()
+    enabled = config.get("railway_ai_enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+
+    api_key = (
+        os.getenv("OKAI_AI_API_KEY", "").strip()
+        or str(config.get("railway_ai_api_key") or config.get("ai_api_key") or "").strip()
+    )
+    url = (
+        os.getenv("OKAI_AI_URL", "").strip()
+        or str(config.get("railway_ai_url") or "").strip()
+        or DEFAULT_AI_URL
+    )
+    return bool(enabled), api_key, url
 
 
 def build_personal_ai_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
@@ -35,7 +71,7 @@ def build_personal_ai_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
 
     feed_age_ms = status.get("feed_age_ms")
     if feed_age_ms is None:
-        # Personal bot should replace this with its real data age when available.
+        # Replace with real data age whenever the personal bot exposes it.
         feed_age_ms = 0 if status.get("feed_connected", True) else 999999
 
     return {
@@ -92,9 +128,10 @@ def predict_with_railway(
     timeout_seconds: float = 6.0,
 ) -> Dict[str, Any]:
     """Call Railway shared AI. Any failure returns a safe NO_TRADE response."""
-    api_key = os.getenv("OKAI_AI_API_KEY", "").strip()
-    url = os.getenv("OKAI_AI_URL", DEFAULT_AI_URL).strip() or DEFAULT_AI_URL
+    enabled, api_key, url = _ai_settings()
 
+    if not enabled:
+        return _blocked("AI_DISABLED")
     if not api_key:
         return _blocked("AI_API_KEY_MISSING")
 
@@ -117,7 +154,7 @@ def predict_with_railway(
         return _blocked("AI_HTTP_%s" % exc.code)
     except (URLError, TimeoutError, OSError):
         return _blocked("AI_SERVER_UNREACHABLE")
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         return _blocked("AI_INVALID_RESPONSE")
 
     if not isinstance(data, dict):
