@@ -27811,6 +27811,189 @@ except Exception:
 # ===== OKAI CAPITAL BASED LOT SIZING V1 END =====
 
 
+
+# ===== OKAI RECOVERY QUALITY MODE V1 START =====
+# Loss ke baad bot OFF nahi hoga.
+# Bas next entry ke liye quality threshold thoda strict:
+# Normal 82, after 1 loss 85, after 2+ losses 87.
+
+def _okai_rec_float(v, default=0.0):
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _okai_rec_today_str():
+    try:
+        return market_now().strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d")
+
+def _okai_rec_row_time_text(row):
+    if not isinstance(row, dict):
+        return ""
+    for k in ("exit_time", "entry_time", "time", "timestamp", "date", "dt", "created_at"):
+        v = row.get(k)
+        if v:
+            return str(v)
+    return ""
+
+def _okai_rec_row_pnl(row):
+    if not isinstance(row, dict):
+        return 0.0
+    for k in ("net_pnl", "pnl", "profit_loss", "profit", "realized_pnl", "Net P&L", "P&L"):
+        if k in row:
+            return _okai_rec_float(row.get(k), 0.0)
+    return 0.0
+
+def _okai_recovery_loss_streak_today():
+    today = _okai_rec_today_str()
+    rows = []
+
+    try:
+        hist = globals().get("trade_history", []) or []
+        for row in hist:
+            if not isinstance(row, dict):
+                continue
+            t = _okai_rec_row_time_text(row)
+            if today in t:
+                rows.append((t, _okai_rec_row_pnl(row)))
+    except Exception:
+        pass
+
+    try:
+        rows.sort(key=lambda x: x[0])
+    except Exception:
+        pass
+
+    streak = 0
+    for _t, pnl in reversed(rows):
+        if pnl < -0.01:
+            streak += 1
+            continue
+        if pnl > 0.01:
+            break
+
+    # fallback: agar trade_history fresh na ho, global loss_streak use karo
+    try:
+        if not rows:
+            streak = max(streak, int(float(globals().get("loss_streak", 0) or 0)))
+    except Exception:
+        pass
+
+    return max(0, int(streak))
+
+def _okai_recovery_required_score():
+    try:
+        normal = int(float(config.get("entry_score", config.get("score_threshold", 82)) or 82))
+    except Exception:
+        normal = 82
+
+    try:
+        one_loss = int(float(config.get("recovery_score_after_1_loss", 85) or 85))
+    except Exception:
+        one_loss = 85
+
+    try:
+        two_loss = int(float(config.get("recovery_score_after_2_loss", 87) or 87))
+    except Exception:
+        two_loss = 87
+
+    streak = _okai_recovery_loss_streak_today()
+
+    if streak >= 2:
+        return max(normal, two_loss), streak
+    if streak == 1:
+        return max(normal, one_loss), streak
+    return normal, streak
+
+def _okai_recovery_setup_score(setup):
+    vals = []
+    if isinstance(setup, dict):
+        for k in ("score", "weighted_score", "entry_score", "final_score", "ai_score"):
+            if setup.get(k) is not None:
+                vals.append(_okai_rec_float(setup.get(k), 0.0))
+    return max(vals) if vals else 0.0
+
+def _okai_recovery_core_score(setup):
+    if not isinstance(setup, dict):
+        return None
+    for k in ("core_score", "core", "core_points", "confirmations"):
+        if setup.get(k) is not None:
+            return _okai_rec_float(setup.get(k), 0.0)
+    return None
+
+try:
+    _OKAI_RECOVERY_BASE_CORE_BRIDGE_QUALITY = core_bridge_weighted_quality_ok
+
+    def core_bridge_weighted_quality_ok(signal, df, price):
+        try:
+            setup = compute_weighted_setup(signal, df, price)
+            regime = str(setup.get("market_regime", "") or "").upper()
+
+            if "SIDEWAYS" in regime or "CHOPPY" in regime or "RANGE" in regime:
+                return False, f"Core bridge blocked: {regime}"
+
+            fake = int(setup.get("fake_breakout_probability", 0) or 0)
+            max_fake = int(_okai_config_float("core_bridge_max_fake_breakout", 42, 20, 70))
+            if fake > max_fake:
+                return False, f"Core bridge blocked: fake breakout {fake}%>{max_fake}%"
+
+            score = _okai_recovery_setup_score(setup)
+            required, streak = _okai_recovery_required_score()
+
+            if score < required:
+                mode = "RECOVERY" if streak > 0 else "NORMAL"
+                return False, (
+                    f"{mode} quality blocked: score {score:.0f}<{required} "
+                    f"| loss_streak={streak} | need stronger setup"
+                )
+
+            core = _okai_recovery_core_score(setup)
+            if streak > 0 and core is not None and core < 4:
+                return False, (
+                    f"RECOVERY quality blocked: core {core:.0f}/5 < 4/5 "
+                    f"| loss_streak={streak}"
+                )
+
+            if streak > 0:
+                return True, (
+                    f"Recovery quality OK | score {score:.0f}/100 >= {required} "
+                    f"| loss_streak={streak} | fake {fake}% | {regime}"
+                )
+
+            return True, f"Weighted quality OK | score {score:.0f}/100 | fake {fake}% | {regime}"
+
+        except Exception as exc:
+            return True, f"Weighted/recovery quality skipped: {str(exc)[:80]}"
+
+except Exception as _okai_rec_patch_e:
+    try:
+        gui_log(f"OKAI RECOVERY QUALITY MODE V1 patch failed: {_okai_rec_patch_e}")
+    except Exception:
+        pass
+
+try:
+    config["recovery_quality_mode"] = True
+    config["recovery_score_after_1_loss"] = int(config.get("recovery_score_after_1_loss", 85) or 85)
+    config["recovery_score_after_2_loss"] = int(config.get("recovery_score_after_2_loss", 87) or 87)
+    config["entry_score"] = int(config.get("entry_score", 82) or 82)
+    config["min_entry_score"] = int(config.get("min_entry_score", 82) or 82)
+    config["score_threshold"] = int(config.get("score_threshold", 82) or 82)
+    save_cloud_config()
+except Exception:
+    pass
+
+try:
+    gui_log("OKAI RECOVERY QUALITY MODE V1 active | normal=82 | after_loss=85 | after_2_loss=87 | bot not stopped")
+except Exception:
+    pass
+# ===== OKAI RECOVERY QUALITY MODE V1 END =====
+
+
 if __name__ == "__main__":
     main()
 
