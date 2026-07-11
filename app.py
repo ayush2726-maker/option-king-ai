@@ -27677,6 +27677,140 @@ except Exception as _okai_subprocess_bt_v2_e:
 # ===== OKAI API SUBPROCESS BACKTEST V2 END =====
 
 
+
+# ===== OKAI CAPITAL BASED LOT SIZING V1 START =====
+# Live/Paper qty now follows available capital, not 1% risk cap.
+# Risk cap becomes warning-only; minimum 1 lot allowed if cash is enough.
+
+def _okai_capqty_float(v, default=0.0):
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _okai_capqty_int(v, default=0):
+    try:
+        if v is None:
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+def _okai_capqty_mode():
+    try:
+        return str(trade_mode()).upper()
+    except Exception:
+        try:
+            return str(config.get("trade_mode") or config.get("mode") or "PAPER").upper()
+        except Exception:
+            return "PAPER"
+
+def _okai_capqty_capital():
+    mode = _okai_capqty_mode()
+    if mode == "LIVE":
+        return max(0.0, _okai_capqty_float(globals().get("capital", 0.0), 0.0))
+    pc = _okai_capqty_float(globals().get("paper_capital", 0.0), 0.0)
+    if pc > 0:
+        return pc
+    return max(0.0, _okai_capqty_float(globals().get("capital", 0.0), 0.0))
+
+def _okai_capqty_use_percent():
+    try:
+        val = config.get("capital_use_percent", config.get("paper_capital_use_percent", 90.0))
+    except Exception:
+        val = 90.0
+    return max(1.0, min(_okai_capqty_float(val, 90.0), 100.0))
+
+def _okai_capqty_lots_for_type(max_lots, trade_type):
+    max_lots = max(0, _okai_capqty_int(max_lots, 0))
+    if max_lots <= 0:
+        return 0
+    try:
+        used = qty_lots_for_trade_type(max_lots, trade_type)
+        used = _okai_capqty_int(used, max_lots)
+    except Exception:
+        used = max_lots
+    return max(1, min(max_lots, used))
+
+def _okai_capqty_calc(premium, trade_type, lot_size):
+    premium = _okai_capqty_float(premium, 0.0)
+    lot_size = max(1, _okai_capqty_int(lot_size, globals().get("FAST_LOT_SIZE", 65)))
+    cap = _okai_capqty_capital()
+    use_pct = _okai_capqty_use_percent()
+    usable = cap * use_pct / 100.0
+    cost_per_lot = premium * lot_size
+
+    if premium <= 0 or cost_per_lot <= 0 or usable < cost_per_lot:
+        return 0, 0, 0, cost_per_lot, usable, cap, use_pct
+
+    max_lots = int(usable // cost_per_lot)
+    used_lots = _okai_capqty_lots_for_type(max_lots, trade_type)
+    qty = used_lots * lot_size
+    return qty, max_lots, used_lots, cost_per_lot, usable, cap, use_pct
+
+def get_qty(premium, trade_type, lot_size):
+    qty, max_lots, used_lots, cost_per_lot, usable, cap, use_pct = _okai_capqty_calc(
+        premium, trade_type, lot_size
+    )
+
+    try:
+        if qty <= 0:
+            _okai_fix_log(
+                f"CAPITAL QTY BLOCK V1 | mode={_okai_capqty_mode()} | capital={cap:.2f} | "
+                f"use={use_pct:.0f}% | usable={usable:.2f} | need_one_lot={cost_per_lot:.2f} | "
+                f"premium={float(premium):.2f} | lot={lot_size}"
+            )
+        else:
+            _okai_fix_log(
+                f"CAPITAL QTY V1 | mode={_okai_capqty_mode()} | capital={cap:.2f} | "
+                f"use={use_pct:.0f}% | premium={float(premium):.2f} | lot={lot_size} | "
+                f"max_lots={max_lots} | used_lots={used_lots} | qty={qty}"
+            )
+    except Exception:
+        pass
+
+    return int(qty)
+
+def _okai_fix_apply_risk_cap_qty(qty, premium, lot_size, option=None):
+    # Risk cap is warning-only now. It must not reduce/block qty when capital can afford lots.
+    qty = _okai_capqty_int(qty, 0)
+    try:
+        premium_f = _okai_capqty_float(premium, 0.0)
+        lot_size_i = max(1, _okai_capqty_int(lot_size, globals().get("FAST_LOT_SIZE", 65)))
+        risk_per_unit, atr14, _df = _okai_fix_dynamic_risk(premium_f, option)
+        risk_budget = _okai_capqty_capital() * max_risk_per_trade_percent() / 100.0
+        risk_amount = risk_per_unit * qty
+        if qty > 0 and risk_per_unit > 0 and risk_amount > risk_budget:
+            _okai_fix_log(
+                f"RISK WARNING ONLY V1 | qty={qty} | lots={qty//lot_size_i} | "
+                f"risk_amount={risk_amount:.2f} > budget={risk_budget:.2f} | "
+                f"risk_per_trade={max_risk_per_trade_percent():.2f}% | trade not blocked"
+            )
+    except Exception:
+        pass
+    return qty
+
+def backtest_risk_cap_qty(bt_capital, qty, premium, lot_size, sl_percent):
+    # Backtest also capital-based. Risk cap disabled for qty cutting.
+    return int(qty or 0)
+
+try:
+    config["qty_mode"] = "CAPITAL_BASED"
+    config["backtest_use_risk_cap"] = "false"
+    config["capital_use_percent"] = float(config.get("capital_use_percent", 90.0) or 90.0)
+    save_cloud_config()
+except Exception:
+    pass
+
+try:
+    _okai_fix_log("OKAI CAPITAL BASED LOT SIZING V1 active | risk cap warning-only | capital_use_percent=90")
+except Exception:
+    pass
+# ===== OKAI CAPITAL BASED LOT SIZING V1 END =====
+
+
 if __name__ == "__main__":
     main()
 
